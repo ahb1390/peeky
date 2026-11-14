@@ -17,18 +17,11 @@ catches your notifications, remembers what you copied, holds your files, and bli
 
 [فارسی](#فارسی)
 
-<img src="docs/hero.jpg" width="860" alt="Peeky at the top of a laptop screen, showing the track that is playing">
+<img src="docs/desktop.png" width="860" alt="Peeky resting at the top of the desktop">
 
 </div>
 
 ## What it does
-
-<div align="center">
-<img src="docs/music.jpg" width="430" alt="Now playing"> <img src="docs/notification.jpg" width="430" alt="A notification in one line">
-<img src="docs/menu.jpg" width="430" alt="The menu, one hover away"> <img src="docs/smart-copy.jpg" width="430" alt="Smart copy answering a sum">
-<img src="docs/shelf.jpg" width="430" alt="Files held on the pill"> <img src="docs/venom.jpg" width="430" alt="The Venom theme">
-<img src="docs/timer.jpg" width="430" alt="Timer"> <img src="docs/settings.jpg" width="430" alt="Settings inside the island">
-</div>
 
 - **Now playing.** Title, artist, cover, controls and a scrubber for whatever is playing on the system. Films and fullscreen games are left alone.
 - **Themes that move.** Liquid skins that drift at rest and flood with colour on the beat (or stay calm, if you switch that off). In **Venom** the pill itself turns to black goo.
@@ -39,11 +32,7 @@ catches your notifications, remembers what you copied, holds your files, and bli
 - **Timer.** Stays in sight while it runs, even over a fullscreen app.
 - **Settings inside the island.** No extra windows.
 
-<div align="center">
-<img src="docs/tour.jpg" width="860" alt="The list of features Peeky shows on its first start">
-</div>
-
-On its first start Peeky says hello and shows this list; it stays in the settings under *What Peeky can do*. A click on a row tries the thing itself.
+On its first start Peeky says hello and shows a list of everything it can do; it stays in the settings under *What Peeky can do*. A click on a row tries the thing itself.
 And also:
 
 - **Quick notes.** `Ctrl+Alt+N` from anywhere, type one line, Enter. A time in the line (`call Ali in 20m`, `at 18:30 gym`, «۱۰ دقیقه دیگه چای») turns it into a reminder.
@@ -76,9 +65,6 @@ cargo build --release
 
 The result is a single `peeky.exe` (about 5 MB). The installer is `installer/island.nsi` (NSIS).
 Every push is built by [GitHub Actions](.github/workflows/build.yml); a tag `vX.Y.Z` publishes a release.
-
-The pictures on this page are made from the real interface: `node shots/shots.mjs` puts `ui/index.html` on a clean scene
-and photographs it with a headless browser.
 
 ## Platforms
 
