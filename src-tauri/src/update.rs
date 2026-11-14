@@ -87,3 +87,34 @@ pub fn start() {
         }
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The installer in dist/ and the signature installer/sign.mjs wrote for it must be accepted; a changed file must not.
+    /// (Skipped when no signed installer has been built here.)
+    #[test]
+    fn signature_made_by_the_release_script_is_accepted() {
+        let dist = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("dist");
+        let (setup, sig) = (dist.join("Peeky-Setup.exe"), dist.join("Peeky-Setup.exe.sig"));
+        if !setup.exists() || !sig.exists() {
+            return;
+        }
+        assert!(signed(&setup, &sig));
+        let bad = std::env::temp_dir().join("peeky-tampered.exe");
+        let mut data = std::fs::read(&setup).unwrap();
+        data[1000] ^= 1;
+        std::fs::write(&bad, data).unwrap();
+        assert!(!signed(&bad, &sig));
+        let _ = std::fs::remove_file(bad);
+    }
+
+    #[test]
+    fn versions_compare_by_number() {
+        assert!(newer("2.10.0", "2.9.9"));
+        assert!(newer("v2.1.1", "2.1.0"));
+        assert!(!newer("2.1.0", "2.1.0"));
+        assert!(!newer("", "2.1.0"));
+    }
+}

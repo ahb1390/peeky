@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Peeky trailer</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { width: 1920px; height: 1080px; overflow: hidden; background: #07080f; font-family: "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif; color: #fff; }
+  #bg { position: absolute; inset: 0; background: radial-gradient(900px 600px at var(--gx, 30%) 20%, rgba(106, 69, 255, .30), transparent 70%), radial-gradient(800px 600px at var(--gx2, 75%) 85%, rgba(34, 211, 238, .16), transparent 70%), #07080f; }
+  #laptop { position: absolute; left: 50%; top: 70px; width: 880px; margin-left: -440px; transform-origin: 50% 0; }
+  #lid { height: 500px; border-radius: 22px 22px 6px 6px; background: #0c0d12; padding: 14px 14px 18px; box-shadow: 0 40px 90px rgba(0, 0, 0, .6), inset 0 0 0 2px #23252f; }
+  #screen { position: relative; width: 100%; height: 100%; border-radius: 10px; overflow: hidden; background: linear-gradient(125deg, #161a30, #40265c); }
+  #bar { position: absolute; left: 0; right: 0; bottom: 0; height: 26px; background: rgba(10, 12, 22, .72); }
+  #bar i { position: absolute; top: 8px; width: 10px; height: 10px; border-radius: 3px; background: rgba(255, 255, 255, .35); }
+  #mini { position: absolute; top: 7px; left: 50%; height: 15px; border-radius: 8px; background: #000; box-shadow: 0 2px 8px rgba(0, 0, 0, .5); }
+  #mini b { position: absolute; top: 4.5px; width: 3px; height: 6px; border-radius: 50%; background: #fff; }
+  #base { height: 20px; margin: 0 -70px; border-radius: 4px 4px 22px 22px; background: linear-gradient(#2a2c38, #14151c); position: relative; }
+  #base::after { content: ""; position: absolute; left: 50%; top: 0; width: 150px; height: 7px; margin-left: -75px; border-radius: 0 0 9px 9px; background: #0c0d12; }
+  #beam { position: absolute; left: 0; top: 0; width: 1920px; height: 1080px; pointer-events: none; }
+  #card { position: absolute; left: 50%; top: 592px; width: 1140px; margin-left: -570px; border-radius: 30px; overflow: hidden; background: linear-gradient(125deg, #161a30, #40265c); box-shadow: 0 30px 80px rgba(0, 0, 0, .65), inset 0 0 0 1.5px rgba(255, 255, 255, .14); transform-origin: 50% 0; }
+  #card img { position: absolute; top: 0; display: block; }
+  .cap { position: absolute; left: 0; right: 0; text-align: center; }
+  #en { top: 846px; font-size: 54px; font-weight: 700; letter-spacing: -.5px; }
+  #fa { top: 928px; font-size: 44px; font-weight: 600; direction: rtl; color: #c9bcff; font-family: "Vazirmatn", "Segoe UI", Tahoma, sans-serif; }
+  #dots { position: absolute; left: 0; right: 0; top: 1028px; display: flex; justify-content: center; gap: 10px; }
+  #dots i { width: 9px; height: 9px; border-radius: 50%; background: rgba(255, 255, 255, .22); }
+  #dots i.on { background: #fff; }
+  #title { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 26px; }
+  #logo { position: relative; width: 300px; height: 128px; border-radius: 64px; background: #000; box-shadow: 0 30px 90px rgba(106, 69, 255, .55), inset 0 0 0 2px rgba(255, 255, 255, .1); }
+  #logo b { position: absolute; top: 44px; width: 26px; height: 40px; border-radius: 50%; background: #fff; }
+  #name { font-size: 132px; font-weight: 800; letter-spacing: -3px; }
+  #tag { font-size: 42px; color: rgba(255, 255, 255, .8); }
+  #tagfa { font-size: 40px; direction: rtl; color: #c9bcff; }
+  #meta { font-size: 30px; color: rgba(255, 255, 255, .6); letter-spacing: 1px; margin-top: 14px; }
+  #more { position: absolute; left: 50%; top: 600px; width: 1280px; margin-left: -640px; display: flex; flex-wrap: wrap; justify-content: center; gap: 18px; }
+  #more span { padding: 12px 26px; border-radius: 36px; background: #000; box-shadow: inset 0 0 0 1.5px rgba(255, 255, 255, .16), 0 10px 30px rgba(0, 0, 0, .5); font-size: 29px; font-weight: 600; }
+  #more span small { display: block; font-size: 23px; font-weight: 500; color: #c9bcff; direction: rtl; margin-top: 2px; }
+</style></head>
+<body>
+<div id="bg"></div>
+<div id="stage">
+  <div id="laptop"><div id="lid"><div id="screen"><div id="mini"><b></b><b></b></div><div id="bar"><i style="left:14px"></i><i style="left:34px"></i><i style="left:54px"></i></div></div></div><div id="base"></div></div>
+  <svg id="beam"><polygon id="beamp" fill="rgba(255,255,255,.035)"/></svg>
+  <div id="card"></div>
+  <div id="more"></div>
+  <div id="en" class="cap"></div><div id="fa" class="cap"></div>
+  <div id="dots"></div>
+</div>
+<div id="title"><div id="logo"><b></b><b></b></div><div id="name">Peeky</div><div id="tag"></div><div id="tagfa"></div><div id="meta"></div></div>
+<script>
+// Everything on the page is a function of time: seek(t) lays out one frame, so a renderer can step through the
+// film at any frame rate and get exactly the same picture every time.
+const SHOTS = [
+  ['idle', 90, 70, 'It sits on top of your screen, and blinks', 'بالای صفحه می‌نشیند و پلک می‌زند'],
+  ['menu', 90, 400, 'Hover, and everything is one click away', 'موس را ببر رویش؛ همه‌چیز یک کلیک فاصله دارد'],
+  ['music-nebula', 90, 285, 'Now playing, with themes that move to the music', 'پخش موزیک، با تم‌هایی که با آهنگ حرکت می‌کنند'],
+  ['music-reactor', 90, 285, 'Liquid camo that floods with colour on every beat', 'کموی مایع که با هر ضرب پر از رنگ می‌شود'],
+  ['venom', 110, 80, 'Or let it turn into something alive', 'یا بگذار به چیزی زنده تبدیل شود'],
+  ['notification', 90, 285, 'Notifications in one line; click to open the chat', 'نوتیفیکیشن در یک خط؛ کلیک کن تا همان چت باز شود'],
+  ['smart-copy', 90, 200, 'Smart copy: links open, sums get answers, dates convert', 'کپی هوشمند: لینک باز می‌شود، حساب جواب می‌گیرد، تاریخ تبدیل می‌شود'],
+  ['shelf', 90, 130, 'Drop files on it; it holds them until you need them', 'فایل را رویش رها کن؛ تا وقتی لازم داری نگهش می‌دارد'],
+  ['timer', 90, 70, 'A timer that stays in sight, even over fullscreen', 'تایمری که همیشه جلوی چشم است، حتی روی فول‌اسکرین'],
+  ['settings', 330, 400, 'Settings live inside the island. No extra windows', 'تنظیمات داخل خود جزیره است؛ بدون پنجرهٔ اضافه'],
+];
+const MORE = [['Quick notes & reminders', 'یادداشت سریع و یادآور'], ['Password vault', 'نگه‌دارندهٔ رمز'], ['Grab text from the screen', 'خواندن متن از روی صفحه'], ['Clipboard history with images', 'تاریخچهٔ کپی با عکس'], ['Mic & camera indicator', 'نشانگر میکروفون و دوربین'], ['Internet & VPN status', 'وضعیت اینترنت و VPN']];
+const T_INTRO = 3.4, T_SHOT = 3.1, T_MORE = 4.4, T_OUTRO = 4.2;
+const DURATION = T_INTRO + SHOTS.length * T_SHOT + T_MORE + T_OUTRO;
+const $ = (s) => document.querySelector(s), clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const ease = (x) => { x = clamp(x, 0, 1); return x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2; };
+const spring = (x) => { x = clamp(x, 0, 1); return 1 - Math.exp(-6.5 * x) * Math.cos(9 * x); };
+const lerp = (a, b, k) => a + (b - a) * k;
+const card = $('#card');
+SHOTS.forEach(([name]) => { const im = new Image(); im.src = '../docs/' + name + '.png'; im.dataset.n = name; card.appendChild(im); });
+$('#dots').innerHTML = SHOTS.map(() => '<i></i>').join('');
+$('#more').innerHTML = MORE.map(([e, f]) => `<span>${e}<small>${f}</small></span>`).join('');
+const blink = (t) => { const p = t % 2.7; return p > 2.5 ? Math.max(0.12, Math.abs(p - 2.6) / 0.1) : 1; };
+function seek(t) {
+  const bg = $('#bg').style; bg.setProperty('--gx', 30 + 12 * Math.sin(t * 0.35) + '%'); bg.setProperty('--gx2', 72 + 10 * Math.cos(t * 0.28) + '%');
+  const tShots = T_INTRO, tMore = tShots + SHOTS.length * T_SHOT, tOutro = tMore + T_MORE;
+  // ---- title card (intro and outro)
+  const inIntro = t < T_INTRO, inOutro = t >= tOutro;
+  const title = $('#title'), k0 = inIntro ? ease(t / 0.7) * (1 - ease((t - (T_INTRO - 0.55)) / 0.55)) : inOutro ? ease((t - tOutro) / 0.7) : 0;
+  title.style.opacity = k0; title.style.transform = `scale(${lerp(0.92, 1, k0)})`;
+  $('#tag').textContent = inOutro ? 'Free and open source' : 'A tiny dynamic island for Windows';
+  $('#tagfa').textContent = inOutro ? 'رایگان و متن‌باز' : 'یک جزیرهٔ کوچک و زنده برای ویندوز';
+  $('#meta').textContent = inOutro ? 'github.com/raminturne/peeky   ·   3 MB   ·   Rust' : '';
+  const logo = $('#logo'), lw = lerp(120, 300, spring((inOutro ? t - tOutro : t) / 0.9)), eb = blink(t + 0.4);
+  logo.style.width = lw + 'px';
+  [...logo.children].forEach((e, i) => { e.style.left = lw / 2 + (i ? 22 : -48) + 'px'; e.style.transform = `scaleY(${eb})`; });
+  // ---- the laptop, the zoomed card and the captions
+  const stageK = inIntro ? ease((t - (T_INTRO - 0.5)) / 0.6) : t >= tOutro ? 1 - ease((t - tOutro) / 0.5) : 1;
+  $('#stage').style.opacity = stageK;
+  const st = clamp(t - tShots, 0, SHOTS.length * T_SHOT - 0.001), idx = Math.floor(st / T_SHOT), local = st - idx * T_SHOT;
+  const moreK = t >= tMore ? ease((t - tMore) / 0.5) * (1 - ease((t - (tOutro - 0.45)) / 0.45)) : 0;
+  const shot = SHOTS[idx], prev = SHOTS[Math.max(0, idx - 1)], k = idx === 0 ? 1 : spring(local / 0.75), fade = idx === 0 ? ease((t - tShots + 0.2) / 0.5) : ease(local / 0.35);
+  const zoom = (s) => s[1] > 200 ? 1.5 : 2.1, hOf = (s) => Math.min(s[1] * zoom(s), 232);
+  const h = lerp(hOf(prev), hOf(shot), ease(local / 0.5)), mw = lerp(prev[2], shot[2], k) * 0.36;
+  $('#laptop').style.transform = `translateY(${lerp(40, 0, stageK)}px) scale(${lerp(1, 0.94, moreK)})`;
+  const mini = $('#mini'); mini.style.width = mw + 'px'; mini.style.marginLeft = -mw / 2 + 'px';
+  [...mini.children].forEach((e, i) => { e.style.left = mw / 2 + (i ? 2 : -5) + 'px'; e.style.opacity = shot[0] === 'idle' || shot[0] === 'venom' ? 1 : 0; e.style.transform = `scaleY(${blink(t)})`; });
+  card.style.height = h + 'px'; card.style.opacity = (1 - moreK) * (t < tMore ? 1 : 0 + (1 - moreK));
+  card.style.transform = `scale(${lerp(0.96, 1, spring(clamp((t - tShots) / 0.8, 0, 1)))})`;
+  [...card.children].forEach((im) => { const z = zoom(SHOTS.find((s) => s[0] === im.dataset.n)); im.style.width = z / 1.5 * 100 + '%'; im.style.left = (1 - z / 1.5) * 50 + '%'; const on = im.dataset.n === shot[0], was = im.dataset.n === prev[0] && idx > 0; im.style.opacity = on ? fade : was ? 1 - fade : 0; im.style.transform = `translateY(${on ? lerp(14, 0, ease(local / 0.5)) : 0}px)`; });
+  const cx = 960, top = 70 + 14 + 7 + 15, cw = 570 * (1 - 0.0);
+  $('#beamp').setAttribute('points', `${cx - mw / 2},${top} ${cx + mw / 2},${top} ${cx + cw},592 ${cx - cw},592`);
+  $('#beam').style.opacity = (1 - moreK) * (t < tMore + 0.5 ? 1 : 0);
+  const capK = t < tMore ? Math.min(ease(local / 0.4), 1 - ease((local - (T_SHOT - 0.3)) / 0.3)) : moreK;
+  const en = $('#en'), fa = $('#fa');
+  en.textContent = t < tMore ? shot[3] : 'And a lot more in 3 MB'; fa.textContent = t < tMore ? shot[4] : 'و کلی قابلیت دیگر، فقط در ۳ مگابایت';
+  en.style.opacity = fa.style.opacity = capK * (t < tMore || moreK > 0 ? 1 : 0);
+  en.style.transform = `translateY(${lerp(16, 0, capK)}px)`; fa.style.transform = `translateY(${lerp(22, 0, capK)}px)`;
+  [...$('#dots').children].forEach((d, i) => { d.className = i === idx && t < tMore ? 'on' : ''; });
+  $('#dots').style.opacity = t < tMore ? 1 : 1 - moreK;
+  const more = $('#more'); more.style.opacity = moreK;
+  [...more.children].forEach((e, i) => { const kk = spring(clamp((t - tMore - 0.25 - i * 0.16) / 0.6, 0, 1)); e.style.transform = `translateY(${lerp(40, 0, kk)}px) scale(${lerp(0.8, 1, kk)})`; e.style.opacity = clamp((t - tMore - 0.25 - i * 0.16) / 0.25, 0, 1); });
+}
+window.seek = seek; window.DURATION = DURATION;
+// opened by hand in a browser it simply plays
+if (!navigator.webdriver) { const t0 = performance.now(); (function loop() { seek(((performance.now() - t0) / 1000) % DURATION); requestAnimationFrame(loop); })(); } else seek(0);
+</script>
+</body></html>
