@@ -16,7 +16,7 @@ const CALENDARS: [&str; 4] = ["gregorian", "shamsi", "shamsi-fa", "both"];
 
 fn defaults() -> Map<String, Value> {
     json!({
-        "autoHide": true, "dndHint": false, "calendar": "gregorian", "hideVideo": true,
+        "autoHide": true, "dndHint": false, "toured": false, "calendar": "gregorian", "hideVideo": true,
         "copyPreview": true, "clipHistory": true, "deviceAlerts": true, "downloadAlerts": true, "shelf": true, "visuals": true,
         "notifSeconds": 4,          // how long a notification stays on the pill
         "face": "eyes",             // what the resting pill shows: "eyes" or "clock"
@@ -110,7 +110,7 @@ pub fn apply(key: &str, value: &Value) {
                 put(key, n.into());
             }
         }
-        "dndHint" => put(key, true.into()),
+        "dndHint" | "toured" => put(key, true.into()),
         _ if BOOLS.contains(&key) => put(key, value.as_bool().unwrap_or(false).into()),
         _ => return,
     }

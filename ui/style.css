@@ -362,3 +362,11 @@ body.daylight #island .sep { background: rgba(24, 34, 47, .25); }
 
 .row.set.info { gap: 10px; }
 
+
+/* the tour: what the app can do, one feature a row */
+.row.tour { cursor: default; }
+.row.tour.can { cursor: pointer; }
+.row.tour.can:hover { background: #121212; transform: scale(1.015); }
+.row.tour .ic.plain { width: 30px; height: 30px; border-radius: 50%; background-color: rgba(255, 255, 255, .09); color: #fff; }
+.row.tour .lbl .dim { overflow: hidden; text-overflow: ellipsis; }
+.row .keys { flex: none; height: 20px; padding: 0 8px; border-radius: 10px; background: rgba(255, 255, 255, .1); color: rgba(255, 255, 255, .75); font-size: 10.5px; display: inline-flex; align-items: center; margin-right: 4px; }

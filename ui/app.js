@@ -307,6 +307,7 @@ side.addEventListener('click', () => {
     else if (n.action === 'download') window.qazi.openDownload(n.path);
     else if (n.action === 'update') window.qazi.updateInstall();
     else if (n.action === 'note') { st.holdUntil = Date.now() + 5000; setStack(true, 'notes'); }
+    else if (n.action === 'tour') { st.holdUntil = Date.now() + 9000; st.revealUntil = Date.now() + 9000; setStack(true, 'tour'); }
     else if (n.aumid) { window.qazi.activate(n.id, n.aumid); dropHistory(n.id); }
   }
   sideHide();
@@ -349,6 +350,7 @@ views.notif.addEventListener('click', () => {
     else if (n.action === 'download') window.qazi.openDownload(n.path);
     else if (n.action === 'update') window.qazi.updateInstall();
     else if (n.action === 'note') { st.holdUntil = Date.now() + 5000; setStack(true, 'notes'); }
+    else if (n.action === 'tour') { st.holdUntil = Date.now() + 9000; st.revealUntil = Date.now() + 9000; setStack(true, 'tour'); }
     else if (n.aumid) { window.qazi.activate(n.id, n.aumid); dropHistory(n.id); }
   }
   endNotif();
@@ -437,6 +439,7 @@ function renderStack() {
   if (st.stackKind === 'vault') { renderVault(); return; }
   if (st.stackKind === 'settings') { renderSettings(); return; }
   if (st.stackKind === 'speedo') { renderSpeedo(); return; }
+  if (st.stackKind === 'tour') { renderTour(); return; }
   $('#stack-clear').textContent = 'Clear all';
   $('#stack-clear').classList.toggle('hidden', !st.history.length);
   if (!st.history.length) {
@@ -1672,6 +1675,7 @@ function renderSpeedo() {
 
 // ------------------------------------------------------------ settings, as rows under the pill
 const SETTINGS_UI = [
+  ['button', 'tour', 'What Peeky can do', 'Show me'],
   ['toggle', 'autoStart', 'Start with Windows'],
   ['toggle', 'autoUpdate', 'Update automatically'],
   ['seg', 'face', 'Resting pill shows', [['eyes', 'Eyes'], ['clock', 'Clock']]],
@@ -1729,7 +1733,7 @@ function renderSettings() {
       const num = document.createElement('span'); num.className = 'num'; num.textContent = cur + unit;
       row.append(mk('minus', -1), num, mk('plus', 1));
     } else if (type === 'button') {
-      const bt = document.createElement('button'); bt.className = 'go'; bt.textContent = a; bt.addEventListener('click', () => window.qazi.action(key));
+      const bt = document.createElement('button'); bt.className = 'go'; bt.textContent = a; bt.addEventListener('click', () => { if (key === 'tour') setStack(true, 'tour'); else window.qazi.action(key); });
       row.appendChild(bt);
     }
     stackList.appendChild(row);
@@ -1746,6 +1750,38 @@ function renderSettings() {
   });
   info.appendChild(up);
   stackList.appendChild(info);
+}
+// What Peeky can do: one row per feature, under the pill. A click on a row tries the thing itself.
+const TOUR = [
+  ['note', 'Now playing', 'Play something: cover, title and controls appear here'],
+  ['bell', 'Notifications', 'One line on the pill. Click it to open that chat', 'inbox'],
+  ['link', 'Smart copy', 'Copy a link, a sum or a date, then click the line'],
+  ['tray', 'File shelf', 'Drop files on the pill. Drag them out when you need them'],
+  ['scan', 'Text grab', 'Drag a box on the screen, the text is copied', 'ocr', 'Ctrl Alt T'],
+  ['jot', 'Quick note', 'One line. "call Ali in 20m" becomes a reminder', 'notes', 'Ctrl Alt N'],
+  ['clipboard', 'Clipboard history', 'Everything you copied, with images and pins', 'clips'],
+  ['key', 'Passwords', 'Makes one, asks what it is for, keeps it encrypted', 'vault'],
+  ['timer', 'Timer', 'Stays in sight while it runs', 'timer'],
+  ['gear', 'Themes and settings', 'Liquid skins, Venom, and every switch', 'settings'],
+];
+function renderTour() {
+  $('#stack-clear').classList.add('hidden');
+  const head = document.createElement('div'); head.className = 'row empty wide'; head.textContent = 'Hover the pill to open its menu';
+  stackList.appendChild(head);
+  TOUR.forEach(([icon, title, text, act, keys], i) => {
+    const row = document.createElement('div'); row.className = 'row set sp tour' + (act ? ' can' : ''); row.style.setProperty('--i', Math.min(i + 1, 6));
+    const ic = document.createElement('div'); ic.className = 'ic plain'; ic.innerHTML = svg(icon);
+    const lbl = document.createElement('span'); lbl.className = 'lbl';
+    const b = document.createElement('b'); b.textContent = title;
+    const d = document.createElement('span'); d.className = 'dim'; d.textContent = text;
+    lbl.append(b, d); row.append(ic, lbl);
+    if (keys) { const k = document.createElement('span'); k.className = 'keys'; k.textContent = keys; row.appendChild(k); }
+    if (act) {
+      row.title = 'Try it';
+      row.addEventListener('click', () => { st.holdUntil = Date.now() + 6000; const bt = $('[data-act="' + act + '"]'); if (act === 'ocr') setStack(false); if (bt) bt.click(); });
+    }
+    stackList.appendChild(row);
+  });
 }
 // opened from the tray icon, or by starting the app a second time
 window.qazi.onOpen((what) => {
@@ -1784,7 +1820,7 @@ window.qazi.onCursor(({ x, y }) => {
 });
 
 // ------------------------------------------------------------ boot
-let hinted = false;
+let hinted = false, toured = false;
 const applySettings = (s) => {
   if (!s) return;
   st.autoHide = s.autoHide !== false;
@@ -1804,6 +1840,13 @@ const applySettings = (s) => {
   st.gen.len = Number(s.vaultLength) || 18; st.gen.symbols = s.vaultSymbols !== false;
   if (st.stackOpen && st.stackKind === 'settings') { const y = stackList.scrollTop; renderStack(); stackList.scrollTop = y; }
   tick(); render();
+  if (!s.toured && !toured) {        // the first start: say hello and offer the list of what it can do
+    toured = true;
+    setTimeout(() => {
+      showNotif({ app: 'Welcome', title: "Hi, I'm Peeky", body: 'Click to see what I can do', action: 'tour', long: true });
+      window.qazi.setSetting('toured', true);
+    }, 1800);
+  }
   if (!s.dndHint && !hinted) {       // one-time guide: Windows has no switch an app may flip, so point at it
     hinted = true;
     setTimeout(() => {

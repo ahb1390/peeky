@@ -89,9 +89,22 @@ pub fn data_dir() -> PathBuf {
         None => {
             let base = PathBuf::from(std::env::var_os("APPDATA").unwrap_or_default());
             let dir = base.join(APP_NAME);
-            if !dir.exists() && base.join(OLD_NAME).exists() {
-                let _ = std::fs::rename(base.join(OLD_NAME), &dir); // settings, pins, notes and passwords move with the new name
+            let old = base.join(OLD_NAME);
+            if !dir.exists() && old.exists() {
+                let _ = std::fs::rename(&old, &dir); // settings, pins, notes and passwords move with the new name
             }
+            // The new folder may already have been there (then nothing was renamed): bring over, once, whatever it lacks.
+            static CARRY: std::sync::Once = std::sync::Once::new();
+            CARRY.call_once(|| {
+                if old.exists() {
+                    let _ = std::fs::create_dir_all(&dir);
+                    for name in ["notes.json", "vault.bin", "clips.json", "settings.json"] {
+                        if !dir.join(name).exists() && old.join(name).exists() {
+                            let _ = std::fs::copy(old.join(name), dir.join(name));
+                        }
+                    }
+                }
+            });
             dir
         }
     };

@@ -1,7 +1,5 @@
 <div align="center">
 
-<img src="docs/idle.png" width="520" alt="Peeky resting at the top of the screen">
-
 # Peeky
 
 **A tiny dynamic island for Windows.** One small pill at the top of your screen that shows what is playing,
@@ -17,26 +15,35 @@ catches your notifications, remembers what you copied, holds your files, and bli
 [![Windows portable exe](https://img.shields.io/badge/WINDOWS-PORTABLE%20.EXE-1f2328?style=for-the-badge)](https://github.com/raminturne/peeky/releases/latest/download/Peeky-Portable.exe)
 [![Windows zip](https://img.shields.io/badge/WINDOWS-.ZIP-1f2328?style=for-the-badge)](https://github.com/raminturne/peeky/releases/latest/download/Peeky-Windows.zip)
 
-[**Watch the trailer**](docs/trailer.mp4) · [فارسی](#فارسی)
+[فارسی](#فارسی)
 
-<a href="docs/trailer.mp4"><img src="docs/trailer.gif" width="760" alt="Peeky trailer"></a>
+<img src="docs/hero.jpg" width="860" alt="Peeky at the top of a laptop screen, showing the track that is playing">
 
 </div>
 
 ## What it does
 
-| | |
-|---|---|
-| <img src="docs/music-nebula.png" width="380"> | **Now playing.** Title, artist, cover, controls and a scrubber for whatever is playing on the system. Films and fullscreen games are left alone. |
-| <img src="docs/music-reactor.png" width="380"> | **Themes that move.** Liquid camo skins that drift at rest and flood with colour on the beat (or stay calm, if you switch that off). |
-| <img src="docs/venom.png" width="380"> | **Venom.** The pill itself turns to black goo: the outline rolls, tendrils reach out and snap back. |
-| <img src="docs/notification.png" width="380"> | **Notifications in one line.** Click to open that chat. While you are using the pill they wait beside it instead of taking it over. |
-| <img src="docs/menu.png" width="380"> | **One hover away.** Screenshot, text grab, clipboard history, quick note, passwords, timer, notifications, settings. |
-| <img src="docs/smart-copy.png" width="380"> | **Smart copy.** A copied link can be opened, a sum gets its answer, a date its twin in the other calendar (Gregorian ⇄ Shamsi), a colour its swatch. |
-| <img src="docs/shelf.png" width="380"> | **File shelf.** Drop files on the pill; they sit there side by side until you drag them out again. |
-| <img src="docs/timer.png" width="380"> | **Timer.** Stays in sight while it runs, even over a fullscreen app. |
-| <img src="docs/settings.png" width="380"> | **Settings inside the island.** No extra windows. |
+<div align="center">
+<img src="docs/music.jpg" width="430" alt="Now playing"> <img src="docs/notification.jpg" width="430" alt="A notification in one line">
+<img src="docs/menu.jpg" width="430" alt="The menu, one hover away"> <img src="docs/smart-copy.jpg" width="430" alt="Smart copy answering a sum">
+<img src="docs/shelf.jpg" width="430" alt="Files held on the pill"> <img src="docs/venom.jpg" width="430" alt="The Venom theme">
+<img src="docs/timer.jpg" width="430" alt="Timer"> <img src="docs/settings.jpg" width="430" alt="Settings inside the island">
+</div>
 
+- **Now playing.** Title, artist, cover, controls and a scrubber for whatever is playing on the system. Films and fullscreen games are left alone.
+- **Themes that move.** Liquid skins that drift at rest and flood with colour on the beat (or stay calm, if you switch that off). In **Venom** the pill itself turns to black goo.
+- **Notifications in one line.** Click to open that chat. While you are using the pill they wait beside it instead of taking it over.
+- **One hover away.** Screenshot, text grab, clipboard history, quick note, passwords, timer, notifications, settings.
+- **Smart copy.** A copied link can be opened, a sum gets its answer, a date its twin in the other calendar (Gregorian ⇄ Shamsi), a colour its swatch.
+- **File shelf.** Drop files on the pill; up to five sit there side by side until you drag them out again.
+- **Timer.** Stays in sight while it runs, even over a fullscreen app.
+- **Settings inside the island.** No extra windows.
+
+<div align="center">
+<img src="docs/tour.jpg" width="860" alt="The list of features Peeky shows on its first start">
+</div>
+
+On its first start Peeky says hello and shows this list; it stays in the settings under *What Peeky can do*. A click on a row tries the thing itself.
 And also:
 
 - **Quick notes.** `Ctrl+Alt+N` from anywhere, type one line, Enter. A time in the line (`call Ali in 20m`, `at 18:30 gym`, «۱۰ دقیقه دیگه چای») turns it into a reminder.
@@ -70,8 +77,8 @@ cargo build --release
 The result is a single `peeky.exe` (about 5 MB). The installer is `installer/island.nsi` (NSIS).
 Every push is built by [GitHub Actions](.github/workflows/build.yml); a tag `vX.Y.Z` publishes a release.
 
-The trailer is code too: `trailer/trailer.html` is a pure function of time and `trailer/render.mjs` steps a headless
-browser through it at 60 frames a second.
+The pictures on this page are made from the real interface: `node shots/shots.mjs` puts `ui/index.html` on a clean scene
+and photographs it with a headless browser.
 
 ## Platforms
 
@@ -103,6 +110,7 @@ Windows today. A Linux version is being worked on; the backend talks to Windows 
 - **رمزها:** رمز می‌سازد، سایت و ایمیل را می‌پرسد و ذخیره می‌کند (رمزنگاری‌شده با حساب ویندوز).
 - **خواندن متن از صفحه:** `Ctrl+Alt+T`، دور متن کادر بکش؛ انگلیسی و فارسی. همه‌چیز روی سیستم خودت انجام می‌شود.
 - **تایمر، تاریخچهٔ کپی با عکس، نشانگر میکروفون و دوربین، وضعیت اینترنت و VPN.**
+- **راهنمای داخل برنامه:** بار اول خودش فهرست قابلیت‌ها را نشان می‌دهد؛ بعداً از تنظیمات، «What Peeky can do».
 - **آپدیت خودکار:** نسخهٔ جدید دانلود، با کلید پروژه بررسی و با یک کلیک نصب می‌شود.
 
 ### نصب
