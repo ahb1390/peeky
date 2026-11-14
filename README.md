@@ -17,7 +17,7 @@ catches your notifications, remembers what you copied, holds your files, and bli
 
 [فارسی](#فارسی)
 
-<img src="docs/desktop.png" width="860" alt="Peeky resting at the top of the desktop">
+<img src="docs/hero.jpg" width="860" alt="Peeky resting at the top of the desktop">
 
 </div>
 
