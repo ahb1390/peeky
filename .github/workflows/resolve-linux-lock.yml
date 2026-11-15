@@ -1,0 +1,30 @@
+name: resolve-linux-cargo-lock
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Resolve the complete Linux dependency graph
+        working-directory: src-tauri
+        run: |
+          cargo generate-lockfile
+          cargo metadata --format-version 1 --locked > /dev/null
+
+      - name: Upload resolved Cargo.lock
+        uses: actions/upload-artifact@v4
+        with:
+          name: Peeky-Linux-Cargo-Lock
+          path: src-tauri/Cargo.lock
+          if-no-files-found: error
+          retention-days: 1
