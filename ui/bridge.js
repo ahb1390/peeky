@@ -12,8 +12,10 @@ listen('drop-paths', (e) => { const done = dropWait.get(e.payload.token); if (do
 
 // Wayland does not expose a global pointer query. Send pointer coordinates only while the
 // compositor has routed input to this surface; Rust restricts the idle input region to the pill.
+let displayServer = '';
 invoke('settings_get').then((settings) => {
-  if (settings && settings.displayServer === 'wayland') {
+  displayServer = settings && settings.displayServer || '';
+  if (displayServer === 'wayland') {
     let lastCursorUpdate = 0;
     window.addEventListener('pointermove', (event) => {
       const now = performance.now();
@@ -32,7 +34,26 @@ window.qazi = {
   onShelf: on('shelf'), onShelfDragging: on('shelf-dragging'), onClips: on('clips'), onLevels: on('levels'),
   onPress: on('press'), onRelease: on('release'), onOpen: on('open'), onHotkey: on('hotkey'), onNotes: on('notes'), onVault: on('vault'), onOcr: on('ocr'), onOcrRead: on('ocr-read'), onSpeedo: on('speedo'),
 
-  setInteractive: (v) => quiet(invoke('set_interactive', { on: !!v })),
+  setInteractive: (v) => {
+    const on = !!v;
+    if (!on && displayServer === 'wayland') {
+      // The visible pill is always 84x36 at rest. Its top coordinate moves above the
+      // screen when tucked, so the only active area left is the visible handle.
+      const island = document.getElementById('island');
+      const rect = island && island.getBoundingClientRect();
+      if (rect) {
+        const width = 84, height = 36;
+        return quiet(invoke('set_interactive', {
+          on: false,
+          x: (window.innerWidth - width) / 2,
+          y: rect.top,
+          width,
+          height,
+        }));
+      }
+    }
+    return quiet(invoke('set_interactive', { on }));
+  },
   setTyping: (v, restore) => invoke('set_typing', { on: !!v, restore: !!restore }).catch(() => ({})),
   lostClick: (info) => quiet(invoke('lost_click', { info: String(info) })),
 
