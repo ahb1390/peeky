@@ -2964,8 +2964,65 @@ fn vault_edit(id: u64, site: String, user: String) -> bool {
 }
 
 #[tauri::command]
+fn process_executable_name(pid: u32) -> String {
+    fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .and_then(|path| path.file_name().map(|name| name.to_string_lossy().to_string()))
+        .unwrap_or_default()
+}
+
+fn focused_sway_node(node: &Value) -> Option<&Value> {
+    if node["focused"].as_bool() == Some(true) { return Some(node); }
+    for key in ["nodes", "floating_nodes"] {
+        if let Some(children) = node[key].as_array() {
+            for child in children {
+                if let Some(found) = focused_sway_node(child) { return Some(found); }
+            }
+        }
+    }
+    None
+}
+
+fn wayland_window_context() -> Value {
+    // Hyprland publishes the focused toplevel as JSON through its supported CLI.
+    if command_exists("hyprctl") {
+        if let Some(raw) = output("hyprctl", &["activewindow", "-j"]) {
+            if let Ok(active) = serde_json::from_str::<Value>(&raw) {
+                let pid = active["pid"].as_u64().and_then(|pid| u32::try_from(pid).ok());
+                if pid == Some(std::process::id()) { return json!({}); }
+                let title = active["title"].as_str().unwrap_or("").trim();
+                let exe = pid.map(process_executable_name).filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| active["class"].as_str().unwrap_or("").to_string());
+                if !title.is_empty() || !exe.is_empty() {
+                    return json!({ "title": title, "exe": exe });
+                }
+            }
+        }
+    }
+
+    // Sway exposes a focused-node tree. Traverse both tiled and floating descendants.
+    if command_exists("swaymsg") {
+        if let Some(raw) = output("swaymsg", &["-t", "get_tree", "-r"]) {
+            if let Ok(tree) = serde_json::from_str::<Value>(&raw) {
+                if let Some(active) = focused_sway_node(&tree) {
+                    let pid = active["pid"].as_u64().and_then(|pid| u32::try_from(pid).ok());
+                    if pid == Some(std::process::id()) { return json!({}); }
+                    let app_id = active["app_id"].as_str().unwrap_or("").trim();
+                    let title = active["name"].as_str().unwrap_or(app_id).trim();
+                    let exe = pid.map(process_executable_name).filter(|name| !name.is_empty())
+                        .unwrap_or_else(|| app_id.to_string());
+                    if !title.is_empty() || !exe.is_empty() {
+                        return json!({ "title": title, "exe": exe });
+                    }
+                }
+            }
+        }
+    }
+    json!({})
+}
+
 fn fg_context() -> Value {
-    if is_wayland() { return json!({}); }
+    if is_wayland() { return wayland_window_context(); }
     let Some(id) = output("xdotool", &["getactivewindow"]) else { return json!({}); };
     if x11_window_pid(&id) == Some(std::process::id()) { return json!({}); }
     x11_window_context(&id)
