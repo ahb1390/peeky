@@ -29,42 +29,102 @@ invoke('settings_get').then((settings) => {
     window.addEventListener('pointerleave', () => {
       quiet(invoke('cursor_update', { x: -1000, y: -1000 }));
     }, { passive: true });
+    requestAnimationFrame(() => pushLinuxInputRegion(false));
   }
 }).catch(() => {});
 
 // Return the union of the visible, interactive surfaces, not the 700x430 transparent
 // WebView. The face, expanded view, open list and side notification remain clickable.
-function inputBounds() {
+function inputRegions() {
   const island = document.getElementById('island');
-  if (!island) return { x: 308, y: 0, width: 84, height: 44 };
-  const elements = [island];
-  const activeView = island.querySelector('.view.on');
-  if (activeView) elements.push(activeView);
-  const stack = document.getElementById('stack');
-  if (stack && stack.classList.contains('open')) elements.push(stack);
-  const side = document.getElementById('side');
-  if (side && side.classList.contains('on')) elements.push(side);
+  if (!island) return [{ x: 308, y: 0, width: 84, height: 44 }];
 
-  let left = Infinity, top = Infinity, right = -Infinity, bottom = -Infinity;
-  for (const element of elements) {
-    const rect = element.getBoundingClientRect();
-    if (!Number.isFinite(rect.left) || !Number.isFinite(rect.top) || rect.width <= 0 || rect.height <= 0) continue;
-    left = Math.min(left, rect.left - 2);
-    top = Math.min(top, rect.top - 2);
-    right = Math.max(right, rect.right + 2);
-    bottom = Math.max(bottom, rect.bottom + 2);
+  const regions = [];
+  const addRect = (rect, padding = 4) => {
+    if (!rect || ![rect.left, rect.top, rect.right, rect.bottom].every(Number.isFinite)) return;
+    const left = Math.max(0, Math.floor(rect.left - padding));
+    const top = Math.max(0, Math.floor(rect.top - padding));
+    const right = Math.min(window.innerWidth, Math.ceil(rect.right + padding));
+    const bottom = Math.min(window.innerHeight, Math.ceil(rect.bottom + padding));
+    if (right > left && bottom > top) {
+      regions.push({ x: left, y: top, width: right - left, height: bottom - top });
+    }
+  };
+
+  const islandRect = island.getBoundingClientRect();
+  addRect(islandRect, 8);
+
+  const activeView = island.classList.contains('tucked') ? null : island.querySelector('.view.on');
+  let activeRect = null;
+  if (activeView) {
+    activeRect = activeView.getBoundingClientRect();
+    addRect(activeRect, 6);
+
+    // The Linux action strip is below the face. Keep only a narrow centre
+    // corridor between them interactive, not the whole transparent gap.
+    if (activeView.dataset.view === 'tools') {
+      const center = (islandRect.left + islandRect.right) / 2;
+      const top = islandRect.bottom - 3;
+      const bottom = activeRect.top + 3;
+      if (bottom > top) addRect({ left: center - 42, top, right: center + 42, bottom }, 0);
+    }
   }
-  left = Math.max(0, left);
-  top = Math.max(0, top);
-  right = Math.min(window.innerWidth, right);
-  bottom = Math.min(window.innerHeight, bottom);
-  if (![left, top, right, bottom].every(Number.isFinite) || right <= left || bottom <= top) {
-    return { x: 308, y: 0, width: 84, height: 44 };
+
+  const stack = document.getElementById('stack');
+  if (stack && stack.classList.contains('open')) {
+    const stackRect = stack.getBoundingClientRect();
+    addRect(stackRect, 6);
+
+    // Keep a slim path from the face/action strip into the stack. This lets the
+    // pointer reach the list without making the full gap across the screen active.
+    const fromBottom = activeView && activeView.dataset.view === 'tools' && activeRect
+      ? activeRect.bottom
+      : islandRect.bottom;
+    const center = (islandRect.left + islandRect.right) / 2;
+    const top = fromBottom - 3;
+    const bottom = stackRect.top + 3;
+    if (bottom > top && bottom - top < 120) {
+      addRect({ left: center - 42, top, right: center + 42, bottom }, 0);
+    }
+  }
+
+  const side = document.getElementById('side');
+  if (side && side.classList.contains('on')) addRect(side.getBoundingClientRect(), 10);
+
+  // Dedupe identical rectangles; Cairo will union overlaps while retaining gaps.
+  const unique = new Map();
+  for (const region of regions) {
+    const key = [region.x, region.y, region.width, region.height].join(',');
+    unique.set(key, region);
+  }
+  return [...unique.values()].slice(0, 12);
+}
+
+function inputBounds(regions = inputRegions()) {
+  if (!regions.length) return { x: 308, y: 0, width: 84, height: 44 };
+  let left = Infinity, top = Infinity, right = -Infinity, bottom = -Infinity;
+  for (const region of regions) {
+    left = Math.min(left, region.x);
+    top = Math.min(top, region.y);
+    right = Math.max(right, region.x + region.width);
+    bottom = Math.max(bottom, region.y + region.height);
   }
   return { x: left, y: top, width: right - left, height: bottom - top };
 }
 
-let inputUpdate = 0, lastIdleRegion = '';
+let inputUpdate = 0, activeInput = false, lastLinuxRegion = '';
+
+function pushLinuxInputRegion(renew = false) {
+  if (hostPlatform !== 'linux') return;
+  const regions = inputRegions();
+  const bounds = inputBounds(regions);
+  const signature = JSON.stringify({ on: activeInput, regions });
+  if (signature === lastLinuxRegion && !renew) return;
+  lastLinuxRegion = signature;
+  invoke('set_interactive', { on: activeInput, ...bounds, regions }).catch(() => {
+    if (lastLinuxRegion === signature) lastLinuxRegion = '';
+  });
+}
 
 window.qazi = {
   onCursor: on('cursor'), onHelper: on('helper'), onSettings: on('settings'), onClip: on('clip'), onDownload: on('download'),
@@ -72,27 +132,34 @@ window.qazi = {
   onPress: on('press'), onRelease: on('release'), onOpen: on('open'), onHotkey: on('hotkey'), onNotes: on('notes'), onVault: on('vault'), onOcr: on('ocr'), onOcrRead: on('ocr-read'), onSpeedo: on('speedo'),
 
   setInteractive: (v) => {
-    const on = !!v;
-    // Keep the Windows bridge contract unchanged; only Linux needs native region geometry.
-    if (hostPlatform !== 'linux') return quiet(invoke('set_interactive', { on }));
+    activeInput = !!v;
     const seq = ++inputUpdate;
     requestAnimationFrame(() => {
       if (seq !== inputUpdate) return;
-      const bounds = inputBounds();
-      const signature = [bounds.x, bounds.y, bounds.width, bounds.height].map((n) => Math.round(n * 2) / 2).join(',');
-      // The active state renews the native watchdog; the idle state only needs to be
-      // sent when its visible hit region actually changes.
-      if (!on && signature === lastIdleRegion) return;
-      if (!on) lastIdleRegion = signature;
-      quiet(invoke('set_interactive', { on, ...bounds }));
+      if (hostPlatform === 'linux') {
+        pushLinuxInputRegion(activeInput);
+        return;
+      }
+      // Keep the Windows bridge contract unchanged.
+      quiet(invoke('set_interactive', { on: activeInput }));
     });
+  },
+  refreshInputRegion: () => {
+    if (hostPlatform === 'linux') pushLinuxInputRegion(false);
   },
   setTyping: (v, restore) => {
     const on = !!v;
-    const args = hostPlatform === 'linux'
-      ? { on, restore: !!restore, ...inputBounds() }
-      : { on, restore: !!restore };
-    return invoke('set_typing', args).catch(() => ({}));
+    if (hostPlatform === 'linux') {
+      activeInput = on;
+      const regions = inputRegions();
+      const bounds = inputBounds(regions);
+      lastLinuxRegion = JSON.stringify({ on: activeInput, regions });
+      return invoke('set_typing', { on, restore: !!restore, ...bounds, regions }).catch(() => {
+        lastLinuxRegion = '';
+        return {};
+      });
+    }
+    return invoke('set_typing', { on, restore: !!restore }).catch(() => ({}));
   },
   lostClick: (info) => quiet(invoke('lost_click', { info: String(info) })),
 

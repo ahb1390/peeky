@@ -1084,49 +1084,105 @@ fn poll_start() {
 }
 
 // ---------------------------------------------------------------- window, tray and application commands
+#[derive(Clone, Copy, Deserialize)]
+struct InputRect {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+fn default_input_regions() -> Vec<InputRect> {
+    vec![InputRect {
+        x: (WIN_W - 84.0) / 2.0,
+        y: 0.0,
+        width: 84.0,
+        height: 44.0,
+    }]
+}
+
+fn legacy_input_regions(
+    x: Option<f64>,
+    y: Option<f64>,
+    width: Option<f64>,
+    height: Option<f64>,
+) -> Option<Vec<InputRect>> {
+    match (x, y, width, height) {
+        (Some(x), Some(y), Some(width), Some(height)) => Some(vec![InputRect {
+            x, y, width, height,
+        }]),
+        _ => None,
+    }
+}
+
 fn apply_linux_input_region(
     window: tauri::WebviewWindow,
-    input_region: Option<(f64, f64, f64, f64)>,
+    input_regions: Vec<InputRect>,
 ) {
     let target = window.clone();
     let _ = window.run_on_main_thread(move || {
-        if let Ok(gtk_window) = target.gtk_window() {
-            // Keep the native hit-test region aligned to visible UI on both X11 and Wayland.
-            // The transparent 700x430 WebView must never become a full-window click blocker.
-            let (x, y, width, height) = input_region
-                .filter(|(x, y, w, h)| {
-                    x.is_finite() && y.is_finite()
-                        && w.is_finite() && h.is_finite()
-                        && *x >= -WIN_W && *x <= WIN_W
-                        && *y >= -WIN_H && *y <= WIN_H
-                        && *w >= 1.0 && *w <= WIN_W
-                        && *h >= 1.0 && *h <= WIN_H
-                })
-                .map(|(x, y, w, h)| (x.round() as i32, y.round() as i32, w.round() as i32, h.round() as i32))
-                // Before the UI bridge has measured the island, expose only a compact
-                // startup target covering its resting pill and the tucked handle.
-                .unwrap_or((308, 0, 84, 44));
-            let rect = RectangleInt::new(x, y, width, height);
-            let region = Region::create_rectangle(&rect);
-            gtk_window.input_shape_combine_region(Some(&region));
-            // GTK commits pending input-region changes during paint on Wayland; queuing
-            // a redraw also keeps the X11 shape in sync with menu geometry.
-            gtk_window.queue_draw();
+        let Ok(gtk_window) = target.gtk_window() else {
+            log("Could not access GTK window while applying input regions");
+            return;
+        };
+
+        // Keep the hit-test areas disjoint. A single union bounding box would also
+        // intercept clicks in the transparent space between the face, action strip,
+        // notification stack and side chip.
+        let mut rectangles: Vec<RectangleInt> = input_regions
+            .into_iter()
+            .take(12)
+            .filter_map(|rect| {
+                if !rect.x.is_finite()
+                    || !rect.y.is_finite()
+                    || !rect.width.is_finite()
+                    || !rect.height.is_finite()
+                    || rect.width <= 0.0
+                    || rect.height <= 0.0
+                {
+                    return None;
+                }
+
+                let left = rect.x.max(0.0).min(WIN_W).floor();
+                let top = rect.y.max(0.0).min(WIN_H).floor();
+                let right = (rect.x + rect.width).max(0.0).min(WIN_W).ceil();
+                let bottom = (rect.y + rect.height).max(0.0).min(WIN_H).ceil();
+                if right <= left || bottom <= top {
+                    return None;
+                }
+
+                Some(RectangleInt::new(
+                    left as i32,
+                    top as i32,
+                    (right - left) as i32,
+                    (bottom - top) as i32,
+                ))
+            })
+            .collect();
+
+        // Never leave the user with an unclickable window if the renderer sends bad
+        // geometry during startup or while a view is being replaced.
+        if rectangles.is_empty() {
+            rectangles.push(RectangleInt::new(308, 0, 84, 44));
         }
+
+        let region = Region::create_rectangles(&rectangles);
+        gtk_window.input_shape_combine_region(Some(&region));
+        gtk_window.queue_draw();
     });
 }
 
 fn set_input_interactive(
     window: tauri::WebviewWindow,
     on: bool,
-    input_region: Option<(f64, f64, f64, f64)>,
+    input_regions: Option<Vec<InputRect>>,
 ) {
     INPUT_INTERACTIVE.store(on, Ordering::SeqCst);
     INPUT_HEARTBEAT.store(now_ms(), Ordering::SeqCst);
-    // Never switch the whole native window to interactive mode. The bridge supplies a
-    // measured region covering only the currently visible pill, menu, list and side chip.
-    // If the renderer has not supplied geometry yet, the compact startup target is safe.
-    apply_linux_input_region(window, input_region);
+
+    // The GTK input shape is enforced on both X11 and Wayland. The "interactive"
+    // state renews the watchdog; it never expands the native window to 700x430.
+    apply_linux_input_region(window, input_regions.unwrap_or_else(default_input_regions));
 }
 
 fn set_interactive_window(
@@ -1135,13 +1191,14 @@ fn set_interactive_window(
     y: Option<f64>,
     width: Option<f64>,
     height: Option<f64>,
+    regions: Option<Vec<InputRect>>,
 ) {
     if let Some(window) = APP.get().and_then(|app| app.get_webview_window("main")) {
-        let idle_region = match (x, y, width, height) {
-            (Some(x), Some(y), Some(width), Some(height)) => Some((x, y, width, height)),
-            _ => None,
-        };
-        set_input_interactive(window, on, idle_region);
+        set_input_interactive(
+            window,
+            on,
+            regions.or_else(|| legacy_input_regions(x, y, width, height)),
+        );
     }
 }
 
@@ -1152,8 +1209,9 @@ fn set_interactive(
     y: Option<f64>,
     width: Option<f64>,
     height: Option<f64>,
+    regions: Option<Vec<InputRect>>,
 ) {
-    set_interactive_window(on, x, y, width, height);
+    set_interactive_window(on, x, y, width, height, regions);
 }
 
 #[tauri::command]
@@ -1221,14 +1279,15 @@ fn set_typing(
     y: Option<f64>,
     width: Option<f64>,
     height: Option<f64>,
+    regions: Option<Vec<InputRect>>,
 ) -> Value {
     let context = if on { capture_previous_x11_window() } else { json!({}) };
     TYPING_ACTIVE.store(on, Ordering::SeqCst);
-    let input_region = match (x, y, width, height) {
-        (Some(x), Some(y), Some(width), Some(height)) => Some((x, y, width, height)),
-        _ => None,
-    };
-    set_input_interactive(window.clone(), on, input_region);
+    set_input_interactive(
+        window.clone(),
+        on,
+        regions.or_else(|| legacy_input_regions(x, y, width, height)),
+    );
     if on {
         if let Err(error) = window.set_focus() {
             log(&format!("Could not focus the Peeky input field: {error}"));
@@ -1791,7 +1850,7 @@ fn main() {
             let _ = window.show();
             // Start with a compact hit target on every Linux display server. The bridge
             // expands it only around controls that are actually visible.
-            apply_linux_input_region(window.clone(), None);
+            set_input_interactive(window.clone(), false, Some(default_input_regions()));
 
             create_tray(app)?;
             if setting_flag("autoStart") { set_autostart(true); }

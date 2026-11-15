@@ -166,6 +166,7 @@ function render() {
   island.classList.toggle('dropping', dragging());
   if (st.tucked) {
     if (island.dataset.w !== 'tuck') { island.dataset.w = 'tuck'; island.style.width = '56px'; }
+    window.qazi.refreshInputRegion?.();
     return;
   }
   const v = pickView();
@@ -186,6 +187,7 @@ function render() {
     glow.style.width = w + 50 + 'px'; glow.style.marginLeft = -(w + 50) / 2 + 'px';
     if (sideN) placeSide();
   }
+  window.qazi.refreshInputRegion?.();
 }
 setInterval(render, 70);
 
@@ -203,11 +205,25 @@ function evalHover(x, y) {
 function hoverNow() {
   const x = st.cx, y = st.cy, r = island.getBoundingClientRect();
   let inside = x >= r.left - 6 && x <= r.right + 6 && y >= r.top - 10 && y <= r.bottom + 8;
-  if (!inside && st.stackOpen) {      // the stack and the gap leading to it count as "on the island"
-    const s = stackEl.getBoundingClientRect();
-    inside = x >= s.left - 4 && x <= s.right + 4 && y >= r.bottom && y <= s.bottom + 10;
+  const activeView = island.querySelector('.view.on');
+  const activeRect = activeView && activeView.getBoundingClientRect();
+  if (!inside && activeRect && activeView.dataset.view !== 'idle') {
+    inside = x >= activeRect.left - 6 && x <= activeRect.right + 6
+      && y >= activeRect.top - 6 && y <= activeRect.bottom + 6;
   }
-  if (!inside && sideN) { const s = side.getBoundingClientRect(); inside = x >= s.left - 8 && x <= s.right + 4 && y >= s.top - 6 && y <= s.bottom + 6; }
+  if (!inside && st.stackOpen) {
+    const s = stackEl.getBoundingClientRect();
+    const center = (r.left + r.right) / 2;
+    const fromBottom = activeView && activeView.dataset.view === 'tools' && activeRect
+      ? activeRect.bottom
+      : r.bottom;
+    const inStack = x >= s.left - 6 && x <= s.right + 6
+      && y >= s.top - 6 && y <= s.bottom + 10;
+    const inConnector = x >= center - 48 && x <= center + 48
+      && y >= fromBottom - 6 && y <= s.top + 6;
+    inside = inStack || inConnector;
+  }
+  if (!inside && sideN) { const s = side.getBoundingClientRect(); inside = x >= s.left - 10 && x <= s.right + 6 && y >= s.top - 8 && y <= s.bottom + 8; }
   if (inside === st.hover || st.dragOut) return false;       // mid-drag the window must not switch to click-through
   st.hover = inside;
   island.classList.toggle('hover', inside && !st.stackOpen && !st.typing);
@@ -219,7 +235,19 @@ function hoverNow() {
 // Every press that Windows delivers to the island is announced here too. If the page's own event for it never
 // arrives (it has happened: the pill looked alive but ignored clicks), the click is carried out anyway.
 let lastDown = 0, lostClicks = 0;
-document.addEventListener('pointerdown', () => { lastDown = performance.now(); }, true);
+document.addEventListener('pointerdown', (event) => {
+  lastDown = performance.now();
+  // A stationary pointer may not produce pointermove after startup. Treat a direct
+  // click on the idle face as an explicit request to open the action strip.
+  if (st.tucked || st.hover || !island.contains(event.target)) return;
+  st.cx = event.clientX;
+  st.cy = event.clientY;
+  st.hover = true;
+  st.enteredAt = Date.now() - 140;
+  island.classList.add('hover');
+  syncMouse();
+  render();
+}, true);
 window.qazi.onPress(({ x, y }) => {
   const at = performance.now();
   setTimeout(() => {
