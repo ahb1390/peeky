@@ -2963,7 +2963,6 @@ fn vault_edit(id: u64, site: String, user: String) -> bool {
     ok
 }
 
-#[tauri::command]
 fn process_executable_name(pid: u32) -> String {
     fs::read_link(format!("/proc/{pid}/exe"))
         .ok()
@@ -3021,6 +3020,7 @@ fn wayland_window_context() -> Value {
     json!({})
 }
 
+#[tauri::command]
 fn fg_context() -> Value {
     if is_wayland() { return wayland_window_context(); }
     let Some(id) = output("xdotool", &["getactivewindow"]) else { return json!({}); };
