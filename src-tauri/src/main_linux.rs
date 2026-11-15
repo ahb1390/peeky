@@ -6,7 +6,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{atomic::{AtomicBool, Ordering}, Mutex, OnceLock},
+    sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Mutex, OnceLock},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -37,6 +37,14 @@ static SHELF: OnceLock<Mutex<Vec<ShelfItem>>> = OnceLock::new();
 static LAST_CLIPBOARD: OnceLock<Mutex<String>> = OnceLock::new();
 static WAYLAND_LAYER_ACTIVE: AtomicBool = AtomicBool::new(false);
 static X11_POINTER_ACTIVE: AtomicBool = AtomicBool::new(false);
+static INPUT_INTERACTIVE: AtomicBool = AtomicBool::new(false);
+static INPUT_HEARTBEAT: AtomicU64 = AtomicU64::new(0);
+static TYPING_ACTIVE: AtomicBool = AtomicBool::new(false);
+static PREVIOUS_X11_WINDOW: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+fn previous_x11_window() -> &'static Mutex<Option<String>> {
+    PREVIOUS_X11_WINDOW.get_or_init(|| Mutex::new(None))
+}
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
@@ -1006,6 +1014,8 @@ fn set_input_interactive(
     on: bool,
     idle_region: Option<(f64, f64, f64, f64)>,
 ) {
+    INPUT_INTERACTIVE.store(on, Ordering::SeqCst);
+    INPUT_HEARTBEAT.store(now_ms(), Ordering::SeqCst);
     if is_wayland() {
         if WAYLAND_LAYER_ACTIVE.load(Ordering::SeqCst) {
             apply_wayland_input_region(window, on, idle_region);
@@ -1055,11 +1065,85 @@ fn cursor_update(x: f64, y: f64) {
     }
 }
 
+fn x11_window_pid(id: &str) -> Option<u32> {
+    output("xdotool", &["getwindowpid", id]).and_then(|value| value.parse::<u32>().ok())
+}
+
+fn x11_window_context(id: &str) -> Value {
+    let title = output("xdotool", &["getwindowname", id]).unwrap_or_default();
+    let exe = x11_window_pid(id)
+        .and_then(|pid| fs::read_link(format!("/proc/{pid}/exe")).ok())
+        .and_then(|path| path.file_name().map(|name| name.to_string_lossy().to_string()))
+        .unwrap_or_default();
+    json!({ "title": title, "exe": exe })
+}
+
+fn capture_previous_x11_window() -> Value {
+    if is_wayland() { return json!({}); }
+    let Some(id) = output("xdotool", &["getactivewindow"]) else { return json!({}); };
+    // Do not replace the saved external window with Peeky itself when an input flow
+    // advances from one field to the next.
+    if x11_window_pid(&id) == Some(std::process::id()) { return json!({}); }
+    *previous_x11_window().lock().unwrap() = Some(id.clone());
+    x11_window_context(&id)
+}
+
+fn restore_previous_x11_window() {
+    if is_wayland() { return; }
+    let Some(previous) = previous_x11_window().lock().unwrap().take() else { return; };
+    let Some(active) = output("xdotool", &["getactivewindow"]) else { return; };
+    // If the user deliberately switched to another app, never steal focus back.
+    if x11_window_pid(&active) != Some(std::process::id()) { return; }
+    if x11_window_pid(&previous).is_none() { return; }
+
+    let activated = Command::new("xdotool")
+        .args(["windowactivate", "--sync", &previous])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !activated {
+        let _ = Command::new("xdotool")
+            .args(["windowfocus", "--sync", &previous])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
 #[tauri::command]
-fn set_typing(window: tauri::WebviewWindow, on: bool, _restore: bool) -> Value {
+fn set_typing(window: tauri::WebviewWindow, on: bool, restore: bool) -> Value {
+    let context = if on { capture_previous_x11_window() } else { json!({}) };
+    TYPING_ACTIVE.store(on, Ordering::SeqCst);
     set_input_interactive(window.clone(), on, None);
-    if on { let _ = window.set_focus(); }
-    json!({})
+    if on {
+        if let Err(error) = window.set_focus() {
+            log(&format!("Could not focus the Peeky input field: {error}"));
+        }
+    } else if restore {
+        restore_previous_x11_window();
+    } else {
+        previous_x11_window().lock().unwrap().take();
+    }
+    context
+}
+
+fn interaction_watchdog_start() {
+    thread::spawn(|| loop {
+        thread::sleep(Duration::from_millis(250));
+        if INPUT_INTERACTIVE.load(Ordering::SeqCst)
+            && now_ms().saturating_sub(INPUT_HEARTBEAT.load(Ordering::SeqCst)) > 4_000
+        {
+            TYPING_ACTIVE.store(false, Ordering::SeqCst);
+            if let Some(window) = APP.get().and_then(|app| app.get_webview_window("main")) {
+                set_input_interactive(window, false, None);
+            }
+            log("The UI stopped renewing its input-capture heartbeat; released pointer input");
+        }
+    });
 }
 
 #[tauri::command]
@@ -1261,12 +1345,8 @@ fn vault_edit(id: u64, site: String, user: String) -> bool {
 fn fg_context() -> Value {
     if is_wayland() { return json!({}); }
     let Some(id) = output("xdotool", &["getactivewindow"]) else { return json!({}); };
-    let title = output("xdotool", &["getwindowname", &id]).unwrap_or_default();
-    let exe = output("xdotool", &["getwindowpid", &id])
-        .and_then(|pid| fs::read_link(format!("/proc/{pid}/exe")).ok())
-        .and_then(|path| path.file_name().map(|s| s.to_string_lossy().to_string()))
-        .unwrap_or_default();
-    json!({ "title": title, "exe": exe })
+    if x11_window_pid(&id) == Some(std::process::id()) { return json!({}); }
+    x11_window_context(&id)
 }
 
 #[tauri::command]
@@ -1487,6 +1567,7 @@ fn main() {
             clipboard_watch();
             downloads_watch();
             x11_pointer_watch();
+            interaction_watchdog_start();
             poll_start();
             settings_broadcast();
             emit("notes", notes_payload(&notes().lock().unwrap()));
