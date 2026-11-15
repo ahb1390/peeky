@@ -39,6 +39,7 @@ features = [
 ]
 
 [target.'cfg(target_os = "linux")'.dependencies]
+gio = "0.18"
 tauri-plugin-global-shortcut = "2"
 gtk = "0.18"
 cairo-rs = "0.18"

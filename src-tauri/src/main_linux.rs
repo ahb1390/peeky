@@ -1,7 +1,7 @@
 // Native Linux backend. X11 and Wayland use the same GTK/WebKit runtime; compositor
 // policy controls placement and global-input features on Wayland.
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     io::{Cursor, Read, Write},
     os::fd::AsRawFd,
@@ -24,6 +24,7 @@ use tauri::{
     Emitter, Manager,
 };
 use gtk::prelude::*;
+use gtk::glib::{self, variant::ToVariant};
 use gdkx11::X11Window;
 use gtk_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use cairo::{RectangleInt, Region};
@@ -64,6 +65,11 @@ struct LinuxUpdate {
 }
 
 static UPDATE_READY: OnceLock<Mutex<Option<LinuxUpdate>>> = OnceLock::new();
+static KDE_NOTIFICATION_IDS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+
+fn kde_notification_ids() -> &'static Mutex<HashSet<u32>> {
+    KDE_NOTIFICATION_IDS.get_or_init(|| Mutex::new(HashSet::new()))
+}
 
 fn update_ready() -> &'static Mutex<Option<LinuxUpdate>> {
     UPDATE_READY.get_or_init(|| Mutex::new(None))
@@ -2359,14 +2365,216 @@ fn set_viz(on: bool) {
     VIZ_ACTIVE.store(on, Ordering::SeqCst);
 }
 
-#[tauri::command]
-fn notif_act(_id: String, _aumid: String) {}
+// ---------------------------------------------------------------- KDE Plasma live notification watcher
+// Plasma's watcher extension forwards notifications to this D-Bus object. The standard
+// freedesktop protocol alone does not provide a cross-application notification history API.
+const KDE_WATCHER_XML: &str = r#"
+<node>
+  <interface name="org.kde.NotificationWatcher">
+    <method name="Notify">
+      <arg name="id" type="u" direction="in"/>
+      <arg name="app_name" type="s" direction="in"/>
+      <arg name="replaces_id" type="u" direction="in"/>
+      <arg name="app_icon" type="s" direction="in"/>
+      <arg name="summary" type="s" direction="in"/>
+      <arg name="body" type="s" direction="in"/>
+      <arg name="actions" type="as" direction="in"/>
+      <arg name="hints" type="a{sv}" direction="in"/>
+      <arg name="timeout" type="i" direction="in"/>
+    </method>
+    <method name="CloseNotification">
+      <arg name="id" type="u" direction="in"/>
+    </method>
+  </interface>
+</node>
+"#;
+
+fn kde_notification_watcher_start() {
+    thread::spawn(|| {
+        let context = glib::MainContext::new();
+        let _context_guard = context.push_thread_default();
+
+        let connection = match gio::bus_get_sync(gio::BusType::Session, None::<&gio::Cancellable>) {
+            Ok(connection) => connection,
+            Err(error) => {
+                log(&format!("KDE notification watcher unavailable: {error}"));
+                return;
+            }
+        };
+        let node = match gio::DBusNodeInfo::for_xml(KDE_WATCHER_XML) {
+            Ok(node) => node,
+            Err(error) => {
+                log(&format!("Could not prepare KDE notification watcher: {error}"));
+                return;
+            }
+        };
+        let Some(interface) = node.lookup_interface("org.kde.NotificationWatcher") else {
+            log("KDE notification watcher interface is missing");
+            return;
+        };
+
+        let registration = connection.register_object(
+            "/NotificationWatcher",
+            &interface,
+            |_, _sender, _path, _interface, method, parameters, invocation| {
+                match method {
+                    "Notify" => {
+                        let parsed = parameters.get::<(
+                            u32,
+                            String,
+                            u32,
+                            String,
+                            String,
+                            String,
+                            Vec<String>,
+                            HashMap<String, glib::Variant>,
+                            i32,
+                        )>();
+                        if let Some((id, app_name, replaces_id, app_icon, summary, body, actions, _hints, _timeout)) = parsed {
+                            if replaces_id != 0 {
+                                kde_notification_ids().lock().unwrap().remove(&replaces_id);
+                                emit("helper", json!({ "t": "notifGone", "id": replaces_id }));
+                            }
+                            kde_notification_ids().lock().unwrap().insert(id);
+                            let app = if app_name.trim().is_empty() { "Desktop" } else { app_name.trim() };
+                            let has_default_action = actions.iter().step_by(2).any(|action| action == "default");
+                            emit("helper", json!({
+                                "t": "notif",
+                                "id": id,
+                                "aumid": if has_default_action { "default" } else { "" },
+                                "app": app,
+                                "title": summary,
+                                "body": body,
+                                "icon": app_icon,
+                                "ts": now_ms()
+                            }));
+                        } else {
+                            log("Ignoring a malformed notification from KDE Plasma");
+                        }
+                        invocation.return_value(None);
+                    }
+                    "CloseNotification" => {
+                        if let Some((id,)) = parameters.get::<(u32,)>() {
+                            // Keep the notification in Peeky's own history after its popup
+                            // times out. This only marks it as no longer active in Plasma.
+                            kde_notification_ids().lock().unwrap().remove(&id);
+                        }
+                        invocation.return_value(None);
+                    }
+                    _ => invocation.return_dbus_error(
+                        "org.freedesktop.DBus.Error.UnknownMethod",
+                        "Unsupported notification watcher method",
+                    ),
+                }
+            },
+            |_, _, _, _, _| ().to_variant(),
+            |_, _, _, _, _, _| false,
+        );
+
+        let registration = match registration {
+            Ok(id) => id,
+            Err(error) => {
+                log(&format!("Could not register KDE notification watcher: {error}"));
+                return;
+            }
+        };
+
+        let registered = connection.call_sync(
+            Some("org.freedesktop.Notifications"),
+            "/org/freedesktop/Notifications",
+            "org.kde.NotificationManager",
+            "RegisterWatcher",
+            None,
+            None,
+            gio::DBusCallFlags::NONE,
+            3000,
+            None::<&gio::Cancellable>,
+        );
+        if let Err(error) = registered {
+            log(&format!("This desktop does not support the KDE notification watcher: {error}"));
+            let _ = connection.unregister_object(registration);
+            return;
+        }
+
+        log("Connected to KDE Plasma notification watcher");
+        let main_loop = glib::MainLoop::new(Some(&context), false);
+        main_loop.run();
+
+        let _ = connection.call_sync(
+            Some("org.freedesktop.Notifications"),
+            "/org/freedesktop/Notifications",
+            "org.kde.NotificationManager",
+            "UnRegisterWatcher",
+            None,
+            None,
+            gio::DBusCallFlags::NONE,
+            1000,
+            None::<&gio::Cancellable>,
+        );
+        let _ = connection.unregister_object(registration);
+    });
+}
+
+fn notification_dbus_call(method: &str, args: &[&str]) -> bool {
+    if !command_exists("gdbus") { return false; }
+    Command::new("gdbus")
+        .args([
+            "call", "--session",
+            "--dest", "org.freedesktop.Notifications",
+            "--object-path", "/org/freedesktop/Notifications",
+            "--method", method,
+        ])
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn notification_action(id: &str, action: &str) -> bool {
+    let Ok(id) = id.parse::<u32>() else { return false; };
+    if action.is_empty() || action.len() > 128 || action.chars().any(char::is_control) { return false; }
+    let id = id.to_string();
+    notification_dbus_call(
+        "org.kde.NotificationManager.InvokeAction",
+        &[&id, action],
+    )
+}
+
+fn notification_dismiss(id: &str) -> bool {
+    let Ok(id) = id.parse::<u32>() else { return false; };
+    let id_text = id.to_string();
+    let closed = notification_dbus_call(
+        "org.freedesktop.Notifications.CloseNotification",
+        &[&id_text],
+    );
+    kde_notification_ids().lock().unwrap().remove(&id);
+    closed
+}
+
+fn notification_clear_active() {
+    let ids: Vec<u32> = kde_notification_ids().lock().unwrap().iter().copied().collect();
+    for id in ids {
+        let _ = notification_dismiss(&id.to_string());
+    }
+}
 
 #[tauri::command]
-fn notif_dismiss(_id: String) {}
+fn notif_act(id: String, aumid: String) {
+    let _ = notification_action(&id, &aumid);
+}
 
 #[tauri::command]
-fn notif_clear() {}
+fn notif_dismiss(id: String) {
+    let _ = notification_dismiss(&id);
+}
+
+#[tauri::command]
+fn notif_clear() {
+    notification_clear_active();
+}
 
 #[tauri::command]
 fn clips_get() -> Value { clip_payload() }
@@ -3103,6 +3311,7 @@ fn main() {
             poll_start();
             visualizer_start();
             update_background_start();
+            kde_notification_watcher_start();
             settings_broadcast();
             emit("notes", notes_payload(&notes().lock().unwrap()));
             emit("vault", vault_payload());
