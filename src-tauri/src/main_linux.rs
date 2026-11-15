@@ -705,6 +705,8 @@ struct VaultItem {
     site: String,
     user: String,
     at: u64,
+    #[serde(default)]
+    len: usize,
 }
 
 fn vault() -> &'static Mutex<Vec<VaultItem>> {
@@ -747,7 +749,7 @@ fn vault_payload() -> Value {
         "locked": locked,
         "items": items.iter().map(|v| json!({
             "id": v.id, "site": v.site, "user": v.user,
-            "len": if locked { 0 } else { secret_lookup(v.id).map(|s| s.chars().count()).unwrap_or(0) },
+            "len": v.len,
             "at": v.at
         })).collect::<Vec<_>>()
     })
@@ -786,7 +788,35 @@ fn secret_store(id: u64, secret: &str, label: &str) -> bool {
 }
 
 fn secret_lookup(id: u64) -> Option<String> {
-    output("secret-tool", &["lookup", "application", "peeky", "entry", &id.to_string()])
+    let mut child = Command::new("secret-tool")
+        .args(["lookup", "application", "peeky", "entry", &id.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => {
+                let mut value = String::new();
+                child.stdout.take()?.read_to_string(&mut value).ok()?;
+                if value.is_empty() { return None; }
+                return Some(value);
+            }
+            Ok(Some(_)) => return None,
+            Ok(None) if started.elapsed() < Duration::from_secs(12) => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                log("Secret Service lookup timed out or could not be reached");
+                return None;
+            }
+        }
+    }
 }
 
 fn vault_save_impl(site: &str, user: &str, pass: &str) -> u64 {
@@ -800,7 +830,13 @@ fn vault_save_impl(site: &str, user: &str, pass: &str) -> u64 {
     if !secret_store(id, pass, &format!("Peeky password for {}", if site.is_empty() { "Untitled" } else { site })) {
         return 0;
     }
-    items.push(VaultItem { id, site: if site.is_empty() { "Untitled".into() } else { site.into() }, user: user.into(), at: now_ms() });
+    items.push(VaultItem {
+        id,
+        site: if site.is_empty() { "Untitled".into() } else { site.into() },
+        user: user.into(),
+        at: now_ms(),
+        len: pass.chars().count(),
+    });
     write_json(&data_dir().join("vault-index.json"), &*items);
     drop(items);
     emit("vault", vault_payload());
@@ -823,8 +859,34 @@ fn vault_edit_impl(id: u64, site: &str, user: &str) -> bool {
 
 fn vault_remove_impl(id: u64) -> bool {
     if !secret_service_available() { return false; }
-    let _ = Command::new("secret-tool").args(["clear", "application", "peeky", "entry", &id.to_string()])
-        .stdout(Stdio::null()).stderr(Stdio::null()).status();
+    let mut child = match Command::new("secret-tool")
+        .args(["clear", "application", "peeky", "entry", &id.to_string()])
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                log(&format!("Could not remove password from Secret Service: {error}"));
+                return false;
+            }
+        };
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(_)) => {
+                log("Secret Service refused to remove the password");
+                return false;
+            }
+            Ok(None) if started.elapsed() < Duration::from_secs(12) => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                log("Secret Service removal timed out");
+                return false;
+            }
+        }
+    }
     let mut items = vault().lock().unwrap();
     items.retain(|v| v.id != id);
     write_json(&data_dir().join("vault-index.json"), &*items);

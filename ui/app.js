@@ -1742,7 +1742,7 @@ function renderVault() {
   $('#stack-clear').classList.add('hidden');
   vaultHead();
   const note = (text) => { const e = document.createElement('div'); e.className = 'row empty wide'; e.textContent = text; stackList.appendChild(e); };
-  if (st.vault.locked) note('Saved passwords could not be opened on this account');
+  if (st.vault.locked) note('Password storage is unavailable. Install and unlock GNOME Keyring or another Secret Service provider, then restart Peeky.');
   const list = vaultFound();
   st.vaultSel = clamp(st.vaultSel, 0, Math.max(0, list.length - 1));
   if (!st.vault.items.length) { if (!st.vault.locked) note('No passwords yet — New makes one'); return; }
