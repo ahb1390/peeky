@@ -111,6 +111,7 @@ island.addEventListener('click', (event) => {
   if (st.settings.platform !== 'linux' || cur !== 'idle' || st.tucked) return;
   if (event.target.closest('button, input, a, .row')) return;
   st.hover = true;
+  st.manual = 'tools';
   st.enteredAt = Date.now() - 200;
   st.leftAt = 0;
   syncMouse(true);
@@ -136,7 +137,9 @@ function pickView() {
   if (st.shelfOn && st.shelf.length) return 'held';      // held files stay on the pill until they are taken out
   const m = st.media;
   if (musicOn() && !st.menuMode && (m.playing || now - st.pausedAt < 12000)) return 'media';
-  if (st.hover && now - st.enteredAt > 130) return 'tools';
+  // Linux keeps the tiny animated face idle on hover. Open the action panel only after
+  // an intentional click; Windows preserves its original hover-to-expand interaction.
+  if (st.settings.platform !== 'linux' && st.hover && now - st.enteredAt > 130) return 'tools';
   if ((st.hover || now - st.leftAt < 380) && cur === 'tools') return 'tools';
   return 'idle';
 }
