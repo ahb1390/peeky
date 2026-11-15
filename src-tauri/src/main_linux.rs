@@ -292,17 +292,58 @@ fn last_clipboard() -> &'static Mutex<String> {
 }
 
 fn clipboard_read() -> Option<String> {
-    if is_wayland() {
-        output("wl-paste", &["--no-newline", "--type", "text/plain"])
+    // Do not use the generic output() helper here: it trims whitespace and line endings,
+    // which changes the exact text the user copied. Try the common MIME targets in order
+    // and preserve the clipboard payload byte-for-byte when it is valid UTF-8.
+    let candidates: &[(&str, &[&str])] = if is_wayland() {
+        &[
+            ("wl-paste", &["--no-newline", "--type", "text/plain;charset=utf-8"]),
+            ("wl-paste", &["--no-newline", "--type", "text/plain"]),
+            ("wl-paste", &["--no-newline", "--type", "UTF8_STRING"]),
+        ]
     } else {
-        output("xclip", &["-selection", "clipboard", "-o", "-t", "UTF8_STRING"])
-            .or_else(|| output("xsel", &["--clipboard", "--output"]))
+        &[
+            ("xclip", &["-selection", "clipboard", "-o", "-t", "UTF8_STRING"]),
+            ("xclip", &["-selection", "clipboard", "-o", "-t", "text/plain;charset=utf-8"]),
+            ("xclip", &["-selection", "clipboard", "-o", "-t", "text/plain"]),
+            ("xsel", &["--clipboard", "--output"]),
+        ]
+    };
+
+    for (program, args) in candidates {
+        let result = Command::new(*program)
+            .args(*args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output();
+        let Ok(result) = result else { continue; };
+        if !result.status.success() || result.stdout.is_empty() { continue; }
+        if let Ok(text) = String::from_utf8(result.stdout) {
+            return Some(text.trim_end_matches('\0').to_string());
+        }
     }
+    None
 }
 
 fn clipboard_write(text: &str, private: bool) -> bool {
     let wayland = is_wayland();
-    let program = if wayland { "wl-copy" } else if command_exists("xclip") { "xclip" } else { "xsel" };
+    let program = if wayland {
+        if command_exists("wl-copy") {
+            "wl-copy"
+        } else {
+            log("Clipboard copy failed: install wl-clipboard (wl-copy) in this Wayland session");
+            return false;
+        }
+    } else if command_exists("xclip") {
+        "xclip"
+    } else if command_exists("xsel") {
+        "xsel"
+    } else {
+        log("Clipboard copy failed: install xclip or xsel in this X11 session");
+        return false;
+    };
+
     let mut cmd = Command::new(program);
     if wayland {
         if private { cmd.arg("--sensitive"); }
@@ -311,10 +352,26 @@ fn clipboard_write(text: &str, private: bool) -> bool {
     } else {
         cmd.args(["--clipboard", "--input"]);
     }
-    let Ok(mut child) = cmd.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() else { return false; };
-    let Some(mut stdin) = child.stdin.take() else { let _ = child.kill(); return false; };
-    if stdin.write_all(text.as_bytes()).is_err() { let _ = child.kill(); return false; }
+
+    let mut child = match cmd.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            log(&format!("Clipboard copy failed to start {program}: {error}"));
+            return false;
+        }
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        log(&format!("Clipboard copy failed: {program} did not accept standard input"));
+        return false;
+    };
+    if let Err(error) = stdin.write_all(text.as_bytes()) {
+        let _ = child.kill();
+        log(&format!("Clipboard copy failed while writing to {program}: {error}"));
+        return false;
+    }
     drop(stdin);
+
     // Clipboard owners must remain alive until another application requests/replaces the
     // selection. Reap them on a background thread; never block the Tauri command on this.
     thread::spawn(move || { let _ = child.wait(); });
@@ -398,12 +455,11 @@ fn clipboard_read_image() -> Option<Vec<u8>> {
     };
 
     for (program, args) in candidates {
-        let result = Command::new(program)
+        let Ok(result) = Command::new(program)
             .args(args)
             .stdin(Stdio::null())
             .stderr(Stdio::null())
-            .output()
-            .ok()?;
+            .output() else { continue; };
         if result.status.success() && !result.stdout.is_empty() {
             return Some(result.stdout);
         }
@@ -1258,12 +1314,21 @@ fn capture_fullscreen() -> Result<Vec<u8>, String> {
 
 fn clipboard_write_png(bytes: &[u8]) -> bool {
     let (program, args): (&str, &[&str]) = if is_wayland() {
+        if !command_exists("wl-copy") {
+            log("Image clipboard copy failed: install wl-clipboard");
+            return false;
+        }
         ("wl-copy", &["--type", "image/png"])
     } else {
+        if !command_exists("xclip") {
+            log("Image clipboard copy failed: install xclip");
+            return false;
+        }
         ("xclip", &["-selection", "clipboard", "-t", "image/png", "-i"])
     };
     let Ok(mut child) = Command::new(program).args(args)
         .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() else {
+            log(&format!("Image clipboard copy failed to start {program}"));
             return false;
         };
     let Some(mut stdin) = child.stdin.take() else { let _ = child.kill(); return false; };
@@ -1723,14 +1788,38 @@ fn set_typing(
         on,
         regions.or_else(|| legacy_input_regions(x, y, width, height)),
     );
-    if on {
-        if let Err(error) = window.set_focus() {
-            log(&format!("Could not focus the Peeky input field: {error}"));
+
+    // A layer-shell surface normally stays passive. Promote it to exclusive keyboard
+    // focus only while a Peeky text/search field is active, then return to on-demand mode.
+    // This is especially important for Wayland compositors: pointer interactivity alone
+    // does not guarantee that WebKit receives typed input or Ctrl+C/Ctrl+V.
+    let focus_window = window.clone();
+    let layer_shell = is_wayland() && gtk_layer_shell::is_supported();
+    if let Err(error) = window.run_on_main_thread(move || {
+        if layer_shell {
+            if let Ok(gtk_window) = focus_window.gtk_window() {
+                gtk_window.set_keyboard_mode(if on {
+                    KeyboardMode::Exclusive
+                } else {
+                    KeyboardMode::OnDemand
+                });
+            }
         }
-    } else if restore {
-        restore_previous_x11_window();
-    } else {
-        previous_x11_window().lock().unwrap().take();
+        if on {
+            if let Err(error) = focus_window.set_focus() {
+                log(&format!("Could not focus the Peeky input field: {error}"));
+            }
+        }
+    }) {
+        log(&format!("Could not schedule Peeky keyboard focus update: {error}"));
+    }
+
+    if !on {
+        if restore {
+            restore_previous_x11_window();
+        } else {
+            previous_x11_window().lock().unwrap().take();
+        }
     }
     context
 }
@@ -2136,15 +2225,22 @@ fn x11_pointer_watch() {
             return;
         }
         let root = (xlib.XDefaultRootWindow)(display);
-        let Some(own_root_child) = x11_root_level_window(xlib, display, own_window_id) else {
-            log("Could not resolve Peeky's top-level X11 window; pointer tracking is disabled");
+        // The window manager can reparent the GTK surface a moment after map(). Retry
+        // instead of permanently disabling pointer tracking during that startup race.
+        let mut resolved_root_child = None;
+        for _ in 0..50 {
+            resolved_root_child = x11_root_level_window(xlib, display, own_window_id);
+            if resolved_root_child.is_some() { break; }
+            thread::sleep(Duration::from_millis(100));
+        }
+        let Some(own_root_child) = resolved_root_child else {
+            log("Could not resolve Peeky's top-level X11 window after 5 seconds; pointer tracking is disabled");
             (xlib.XCloseDisplay)(display);
             X11_POINTER_ACTIVE.store(false, Ordering::SeqCst);
             return;
         };
 
         X11_POINTER_ACTIVE.store(true, Ordering::SeqCst);
-        let mut was_near = false;
         let mut last_emit = std::time::Instant::now();
         let mut last_down = false;
         let mut press_belongs_to_peeky = false;
@@ -2181,15 +2277,15 @@ fn x11_pointer_watch() {
             let near = x > -80.0 && x < WIN_W + 80.0 && y > -80.0 && y < WIN_H + 80.0;
 
             let pointer_moved = (x - last_x).abs() > 0.1 || (y - last_y).abs() > 0.1;
-            if (near || was_near)
-                && (pointer_moved || last_emit.elapsed() >= Duration::from_millis(32))
-            {
+            // X11 can report the global pointer without taking input from other apps.
+            // Emit movement even when the cursor is outside Peeky's transparent window;
+            // the face renderer can then follow the user across the whole desktop.
+            if pointer_moved && last_emit.elapsed() >= Duration::from_millis(16) {
                 emit("cursor", json!({ "x": (x * 10.0).round() / 10.0, "y": (y * 10.0).round() / 10.0 }));
                 last_emit = std::time::Instant::now();
                 last_x = x;
                 last_y = y;
             }
-            was_near = near;
 
             // Match the Windows hit-test fallback: only announce a press when the actual
             // top-level window under the pointer is Peeky, not merely when the coordinates

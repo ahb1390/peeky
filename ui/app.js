@@ -2006,10 +2006,17 @@ const blink = () => emote('blink', 130);
   }
   setTimeout(faceLoop, 1700 + Math.random() * 3600);
 })();
-// the eyes follow the cursor a little when it comes near
+// The face follows the system pointer on X11. Wayland only reports pointer movement
+// while the compositor routes events to Peeky's own surface.
 window.qazi.onCursor(({ x, y }) => {
+  // pointerleave uses this sentinel on Wayland, where global pointer queries are blocked.
+  if (x === -1000 && y === -1000) {
+    face.style.setProperty('--lx', '0px');
+    face.style.setProperty('--ly', '0px');
+    return;
+  }
   const dx = x - window.innerWidth / 2, dy = y - 26, d = Math.hypot(dx, dy);
-  const k = d < 420 && d > 1 ? Math.min(1, d / 120) : 0;
+  const k = d > 1 ? Math.min(1, d / 120) : 0;
   face.style.setProperty('--lx', (k ? dx / d * 2.4 * k : 0).toFixed(2) + 'px');
   face.style.setProperty('--ly', (k ? dy / d * 1.6 * k : 0).toFixed(2) + 'px');
 });
