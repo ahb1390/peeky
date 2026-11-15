@@ -966,7 +966,11 @@ fn poll_start() {
 }
 
 // ---------------------------------------------------------------- window, tray and application commands
-fn apply_wayland_input_region(window: tauri::WebviewWindow, interactive: bool) {
+fn apply_wayland_input_region(
+    window: tauri::WebviewWindow,
+    interactive: bool,
+    idle_region: Option<(f64, f64, f64, f64)>,
+) {
     let target = window.clone();
     let _ = window.run_on_main_thread(move || {
         if let Ok(gtk_window) = target.gtk_window() {
@@ -974,9 +978,22 @@ fn apply_wayland_input_region(window: tauri::WebviewWindow, interactive: bool) {
                 // The WebView receives the complete window while the user is interacting.
                 gtk_window.input_shape_combine_region(None);
             } else {
-                // Keep only the visible pill hit-target active. Everything else passes through
-                // to the desktop until the pointer enters this region.
-                let rect = RectangleInt::new(255, 0, 190, 72);
+                // In idle mode only the resting 84x36 pill (or its visible tucked handle)
+                // receives pointer input. Do not leave a large invisible rectangle over apps.
+                let (x, y, width, height) = idle_region
+                    .filter(|(x, y, w, h)| {
+                        x.is_finite() && y.is_finite()
+                            && w.is_finite() && h.is_finite()
+                            && *x >= -WIN_W && *x <= WIN_W
+                            && *y >= -WIN_H && *y <= WIN_H
+                            && *w >= 1.0 && *w <= WIN_W
+                            && *h >= 1.0 && *h <= WIN_H
+                    })
+                    .map(|(x, y, w, h)| (x.round() as i32, y.round() as i32, w.round() as i32, h.round() as i32))
+                    // Before the UI bridge has measured the pill, keep a narrow startup target
+                    // covering both the normal resting position and the three-pixel tucked handle.
+                    .unwrap_or((308, 0, 84, 44));
+                let rect = RectangleInt::new(x, y, width, height);
                 let region = Region::create_rectangle(&rect);
                 gtk_window.input_shape_combine_region(Some(&region));
             }
@@ -984,10 +1001,14 @@ fn apply_wayland_input_region(window: tauri::WebviewWindow, interactive: bool) {
     });
 }
 
-fn set_input_interactive(window: tauri::WebviewWindow, on: bool) {
+fn set_input_interactive(
+    window: tauri::WebviewWindow,
+    on: bool,
+    idle_region: Option<(f64, f64, f64, f64)>,
+) {
     if is_wayland() {
         if WAYLAND_LAYER_ACTIVE.load(Ordering::SeqCst) {
-            apply_wayland_input_region(window, on);
+            apply_wayland_input_region(window, on, idle_region);
         }
         // On compositors without layer-shell, keep the ordinary decorated window interactive.
     } else if X11_POINTER_ACTIVE.load(Ordering::SeqCst) {
@@ -1000,14 +1021,32 @@ fn set_input_interactive(window: tauri::WebviewWindow, on: bool) {
     }
 }
 
-fn set_interactive_window(on: bool) {
+fn set_interactive_window(
+    on: bool,
+    x: Option<f64>,
+    y: Option<f64>,
+    width: Option<f64>,
+    height: Option<f64>,
+) {
     if let Some(window) = APP.get().and_then(|app| app.get_webview_window("main")) {
-        set_input_interactive(window, on);
+        let idle_region = match (x, y, width, height) {
+            (Some(x), Some(y), Some(width), Some(height)) => Some((x, y, width, height)),
+            _ => None,
+        };
+        set_input_interactive(window, on, idle_region);
     }
 }
 
 #[tauri::command]
-fn set_interactive(on: bool) { set_interactive_window(on); }
+fn set_interactive(
+    on: bool,
+    x: Option<f64>,
+    y: Option<f64>,
+    width: Option<f64>,
+    height: Option<f64>,
+) {
+    set_interactive_window(on, x, y, width, height);
+}
 
 #[tauri::command]
 fn cursor_update(x: f64, y: f64) {
@@ -1018,7 +1057,7 @@ fn cursor_update(x: f64, y: f64) {
 
 #[tauri::command]
 fn set_typing(window: tauri::WebviewWindow, on: bool, _restore: bool) -> Value {
-    set_input_interactive(window.clone(), on);
+    set_input_interactive(window.clone(), on, None);
     if on { let _ = window.set_focus(); }
     json!({})
 }
@@ -1435,7 +1474,7 @@ fn main() {
 
             let _ = window.show();
             if layer_shell {
-                apply_wayland_input_region(window.clone(), false);
+                apply_wayland_input_region(window.clone(), false, None);
             } else if !is_wayland() {
                 let _ = window.set_ignore_cursor_events(true);
             } else {
