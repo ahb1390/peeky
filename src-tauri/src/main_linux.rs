@@ -6,11 +6,13 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    ptr,
     sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Mutex, OnceLock},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use glib::object::Cast;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use tauri::{
@@ -19,6 +21,7 @@ use tauri::{
     Emitter, Manager,
 };
 use gtk::prelude::*;
+use gdkx11::X11Window;
 use gtk_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use cairo::{RectangleInt, Region};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, ShortcutState};
@@ -36,6 +39,7 @@ static CLIPS: OnceLock<Mutex<Vec<ClipEntry>>> = OnceLock::new();
 static SHELF: OnceLock<Mutex<Vec<ShelfItem>>> = OnceLock::new();
 static LAST_CLIPBOARD: OnceLock<Mutex<String>> = OnceLock::new();
 static X11_POINTER_ACTIVE: AtomicBool = AtomicBool::new(false);
+static X11_LIB: OnceLock<x11_dl::xlib::Xlib> = OnceLock::new();
 static INPUT_INTERACTIVE: AtomicBool = AtomicBool::new(false);
 static INPUT_HEARTBEAT: AtomicU64 = AtomicU64::new(0);
 static TYPING_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -1543,42 +1547,166 @@ fn position_x11_window(window: &tauri::WebviewWindow) {
     }
 }
 
+fn initialize_x11_threading() {
+    if is_wayland() { return; }
+    let Ok(xlib) = x11_dl::xlib::Xlib::open() else {
+        log("libX11 is unavailable; using a normal interactive window without X11 pointer tracking");
+        return;
+    };
+    // GTK/WebKit also use Xlib. XInitThreads must be called before either library opens
+    // its display connection; the X11 polling thread then owns a separate Display handle.
+    let initialized = unsafe { (xlib.XInitThreads)() };
+    if initialized == 0 {
+        log("XInitThreads failed; using a normal interactive window without X11 pointer tracking");
+        return;
+    }
+    let _ = X11_LIB.set(xlib);
+}
+
+fn x11_native_window_id(window: &tauri::WebviewWindow) -> Option<x11_dl::xlib::Window> {
+    let gtk_window = window.gtk_window().ok()?;
+    let gdk_window = gtk_window.window()?;
+    let x11_window = gdk_window.downcast::<X11Window>().ok()?;
+    Some(x11_window.xid() as _)
+}
+
+unsafe fn x11_root_level_window(
+    xlib: &x11_dl::xlib::Xlib,
+    display: *mut x11_dl::xlib::Display,
+    mut current: x11_dl::xlib::Window,
+) -> Option<x11_dl::xlib::Window> {
+    // Window managers may reparent client windows inside decoration/frame windows.
+    // Walk upwards so the pointer's root child can be compared with Peeky's real top-level.
+    for _ in 0..32 {
+        let mut root = 0;
+        let mut parent = 0;
+        let mut children: *mut x11_dl::xlib::Window = ptr::null_mut();
+        let mut child_count = 0u32;
+        let ok = (xlib.XQueryTree)(
+            display,
+            current,
+            &mut root,
+            &mut parent,
+            &mut children,
+            &mut child_count,
+        );
+        if !children.is_null() {
+            (xlib.XFree)(children.cast());
+        }
+        if ok == 0 || root == 0 || parent == 0 || parent == current {
+            return None;
+        }
+        if parent == root {
+            return Some(current);
+        }
+        current = parent;
+    }
+    None
+}
+
 fn x11_pointer_watch() {
     if is_wayland() { return; }
-    if !command_exists("xdotool") {
+    let Some(xlib) = X11_LIB.get() else {
         X11_POINTER_ACTIVE.store(false, Ordering::SeqCst);
-        log("xdotool is unavailable; using a normal interactive window instead of X11 click-through mode");
         if let Some(window) = APP.get().and_then(|app| app.get_webview_window("main")) {
             let _ = window.set_ignore_cursor_events(false);
         }
         return;
-    }
-    X11_POINTER_ACTIVE.store(true, Ordering::SeqCst);
-    thread::spawn(|| {
+    };
+    let Some(window) = APP.get().and_then(|app| app.get_webview_window("main")) else { return; };
+    let Some(own_window_id) = x11_native_window_id(&window) else {
+        log("Could not obtain Peeky's native X11 window id; pointer tracking is disabled");
+        X11_POINTER_ACTIVE.store(false, Ordering::SeqCst);
+        let _ = window.set_ignore_cursor_events(false);
+        return;
+    };
+
+    thread::spawn(move || unsafe {
+        let display = (xlib.XOpenDisplay)(ptr::null());
+        if display.is_null() {
+            log("XOpenDisplay failed; pointer tracking is disabled");
+            X11_POINTER_ACTIVE.store(false, Ordering::SeqCst);
+            let _ = window.set_ignore_cursor_events(false);
+            return;
+        }
+        let root = (xlib.XDefaultRootWindow)(display);
+        let Some(own_root_child) = x11_root_level_window(xlib, display, own_window_id) else {
+            log("Could not resolve Peeky's top-level X11 window; pointer tracking is disabled");
+            (xlib.XCloseDisplay)(display);
+            X11_POINTER_ACTIVE.store(false, Ordering::SeqCst);
+            let _ = window.set_ignore_cursor_events(false);
+            return;
+        };
+
+        X11_POINTER_ACTIVE.store(true, Ordering::SeqCst);
         let mut was_near = false;
         let mut last_emit = std::time::Instant::now();
+        let mut last_down = false;
+        let mut press_belongs_to_peeky = false;
+        let mut last_x = -1000.0;
+        let mut last_y = -1000.0;
+
         loop {
-            thread::sleep(Duration::from_millis(55));
-            let Some(raw) = output("xdotool", &["getmouselocation", "--shell"]) else { continue; };
-            let mut screen_x = None;
-            let mut screen_y = None;
-            for line in raw.lines() {
-                if let Some(value) = line.strip_prefix("SCREEN_X=") { screen_x = value.parse::<f64>().ok(); }
-                if let Some(value) = line.strip_prefix("SCREEN_Y=") { screen_y = value.parse::<f64>().ok(); }
-            }
-            let (Some(sx), Some(sy)) = (screen_x, screen_y) else { continue; };
-            let Some(window) = APP.get().and_then(|app| app.get_webview_window("main")) else { continue; };
+            thread::sleep(Duration::from_millis(16));
+
+            let mut pointer_root = 0;
+            let mut pointer_child = 0;
+            let mut root_x = 0;
+            let mut root_y = 0;
+            let mut window_x = 0;
+            let mut window_y = 0;
+            let mut mask = 0u32;
+            let queried = (xlib.XQueryPointer)(
+                display,
+                root,
+                &mut pointer_root,
+                &mut pointer_child,
+                &mut root_x,
+                &mut root_y,
+                &mut window_x,
+                &mut window_y,
+                &mut mask,
+            );
+            if queried == 0 { continue; }
+
             let (Ok(position), Ok(scale)) = (window.outer_position(), window.scale_factor()) else { continue; };
             let scale = scale.max(0.5);
-            let x = (sx - position.x as f64) / scale;
-            let y = (sy - position.y as f64) / scale;
+            let x = (root_x - position.x) as f64 / scale;
+            let y = (root_y - position.y) as f64 / scale;
             let near = x > -80.0 && x < WIN_W + 80.0 && y > -80.0 && y < WIN_H + 80.0;
-            if (near || was_near) && last_emit.elapsed() >= Duration::from_millis(25) {
+
+            if (near || was_near)
+                && (x - last_x).abs() > 0.1
+                    || (near || was_near) && (y - last_y).abs() > 0.1
+                    || (near || was_near) && last_emit.elapsed() >= Duration::from_millis(32)
+            {
                 emit("cursor", json!({ "x": (x * 10.0).round() / 10.0, "y": (y * 10.0).round() / 10.0 }));
                 last_emit = std::time::Instant::now();
+                last_x = x;
+                last_y = y;
             }
             was_near = near;
+
+            // Match the Windows hit-test fallback: only announce a press when the actual
+            // top-level window under the pointer is Peeky, not merely when the coordinates
+            // overlap its 700x430 transparent WebView rectangle.
+            let left_button_down = mask & (1 << 8) != 0; // X11 Button1Mask
+            if left_button_down
+                && !last_down
+                && INPUT_INTERACTIVE.load(Ordering::SeqCst)
+                && near
+                && pointer_child == own_root_child
+            {
+                press_belongs_to_peeky = true;
+                emit("press", json!({ "x": x, "y": y }));
+            } else if !left_button_down && last_down && press_belongs_to_peeky {
+                press_belongs_to_peeky = false;
+                emit("release", json!({ "x": x, "y": y }));
+            }
+            last_down = left_button_down;
         }
+
+        (xlib.XCloseDisplay)(display);
     });
 }
 
@@ -1590,6 +1718,7 @@ fn register_x11_hotkeys(app: &tauri::App) {
 }
 
 fn main() {
+    initialize_x11_threading();
     settings_load();
     notes_load();
     vault_load();
