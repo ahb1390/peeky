@@ -930,6 +930,76 @@ fn net_state() -> bool {
     })).unwrap_or(false)
 }
 
+fn x11_window_geometry(id: &str) -> Option<(i32, i32, i32, i32)> {
+    let raw = output("xdotool", &["getwindowgeometry", "--shell", id])?;
+    let mut x = None;
+    let mut y = None;
+    let mut width = None;
+    let mut height = None;
+    for line in raw.lines() {
+        if let Some(value) = line.strip_prefix("X=") { x = value.parse::<i32>().ok(); }
+        if let Some(value) = line.strip_prefix("Y=") { y = value.parse::<i32>().ok(); }
+        if let Some(value) = line.strip_prefix("WIDTH=") { width = value.parse::<i32>().ok(); }
+        if let Some(value) = line.strip_prefix("HEIGHT=") { height = value.parse::<i32>().ok(); }
+    }
+    Some((x?, y?, width?, height?))
+}
+
+// Detect the external X11 window underneath Peeky. When Peeky temporarily owns focus for
+// a text field, retain the last external window instead of treating Peeky as the covered app.
+fn x11_cover_state(last_external: &mut Option<String>) -> Option<(bool, bool)> {
+    if is_wayland() || !X11_POINTER_ACTIVE.load(Ordering::SeqCst) { return None; }
+    let active = output("xdotool", &["getactivewindow"])?;
+    let active_pid = x11_window_pid(&active);
+    let target = if active_pid == Some(std::process::id()) {
+        last_external.clone()?
+    } else {
+        let title = output("xdotool", &["getwindowname", &active]).unwrap_or_default();
+        if title.trim().is_empty() {
+            *last_external = None;
+            return Some((false, false));
+        }
+        *last_external = Some(active.clone());
+        active
+    };
+
+    let title = output("xdotool", &["getwindowname", &target]).unwrap_or_default();
+    if title.trim().is_empty() {
+        *last_external = None;
+        return Some((false, false));
+    }
+    let (x, y, width, height) = x11_window_geometry(&target)?;
+    if width <= 0 || height <= 0 { return Some((false, false)); }
+
+    let Some(window) = APP.get().and_then(|app| app.get_webview_window("main")) else { return None; };
+    let Ok(position) = window.outer_position() else { return None; };
+    let Ok(size) = window.outer_size() else { return None; };
+    let Ok(scale) = window.scale_factor() else { return None; };
+    let center_x = position.x + size.width as i32 / 2;
+    let center_y = position.y + (26.0 * scale.max(0.5)).round() as i32;
+
+    let right = x.saturating_add(width);
+    let bottom = y.saturating_add(height);
+    let covered = x <= center_x && center_x < right && y <= center_y && center_y < bottom;
+
+    let monitors = window.available_monitors().ok()?;
+    let monitor = monitors.into_iter().find(|monitor| {
+        let p = monitor.position();
+        let s = monitor.size();
+        center_x >= p.x
+            && center_x < p.x + s.width as i32
+            && center_y >= p.y
+            && center_y < p.y + s.height as i32
+    })?;
+    let monitor_position = monitor.position();
+    let monitor_size = monitor.size();
+    let full = x <= monitor_position.x
+        && y <= monitor_position.y
+        && right >= monitor_position.x + monitor_size.width as i32
+        && bottom >= monitor_position.y + monitor_size.height as i32;
+    Some((covered, full))
+}
+
 fn poll_start() {
     thread::spawn(|| {
         let mut previous_media = Value::Null;
@@ -938,11 +1008,17 @@ fn poll_start() {
         let mut net_tick = 0u8;
         let mut volume_tick = 0u8;
         let mut media_tick = 0u8;
+        let mut window_tick = 0u8;
+        let mut last_external_window = None;
+        let mut window_state_candidate: Option<(bool, bool)> = None;
+        let mut window_state_sent: Option<(bool, bool)> = None;
+        let mut window_state_count = 0u8;
         loop {
             thread::sleep(Duration::from_millis(250));
             media_tick = media_tick.wrapping_add(1);
             volume_tick = volume_tick.wrapping_add(1);
             net_tick = net_tick.wrapping_add(1);
+            window_tick = window_tick.wrapping_add(1);
             if media_tick >= 2 {
                 media_tick = 0;
                 let state = media_metadata();
@@ -967,6 +1043,23 @@ fn poll_start() {
                 if last_online != Some(online) {
                     emit("helper", json!({ "t": "net", "online": online, "vpn": "", "proxy": std::env::var_os("http_proxy").is_some() || std::env::var_os("https_proxy").is_some(), "first": last_online.is_none() }));
                     last_online = Some(online);
+                }
+            }
+            // X11 can inspect the active window geometry. Report only after two matching samples
+            // so rapid focus/raise changes do not make the island flicker over applications.
+            if window_tick >= 2 {
+                window_tick = 0;
+                if let Some(state) = x11_cover_state(&mut last_external_window) {
+                    if window_state_candidate == Some(state) {
+                        window_state_count = window_state_count.saturating_add(1);
+                    } else {
+                        window_state_candidate = Some(state);
+                        window_state_count = 1;
+                    }
+                    if window_state_count >= 2 && window_state_sent != Some(state) {
+                        emit("helper", json!({ "t": "cover", "covered": state.0, "full": state.1 }));
+                        window_state_sent = Some(state);
+                    }
                 }
             }
         }
