@@ -6,3 +6,7 @@ include!("main_windows.rs");
 
 #[cfg(target_os = "linux")]
 include!("main_linux.rs");
+
+// Do not silently produce an empty or partially configured application on unsupported targets.
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+compile_error!("Peeky currently supports only Windows and Linux targets.");
