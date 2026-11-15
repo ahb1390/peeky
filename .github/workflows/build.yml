@@ -93,9 +93,12 @@ jobs:
               "128x128@2x.png": 256,
               "icon.png": 512,
           }
+          # Pillow < 9.1 exposes LANCZOS directly on Image; newer releases moved
+          # resampling filters under Image.Resampling. Support both runner versions.
+          lanczos = getattr(Image, "Resampling", Image).LANCZOS
           for filename, size in sizes.items():
               target = Path("src-tauri/icons") / filename
-              source.resize((size, size), Image.Resampling.LANCZOS).save(target, format="PNG")
+              source.resize((size, size), lanczos).save(target, format="PNG")
           PY
 
       - name: Build and package Debian application
