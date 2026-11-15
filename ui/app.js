@@ -180,11 +180,17 @@ function render() {
   // bar across the browser's tab row. Windows keeps the original expanding-pill layout.
   const linuxTools = st.settings.platform === 'linux' && cur === 'tools';
   const linuxTimer = st.settings.platform === 'linux' && cur === 'timer';
+  const linuxInput = st.settings.platform === 'linux' && cur === 'input';
+  const linuxGen = st.settings.platform === 'linux' && cur === 'gen';
+  const linuxPopover = linuxTools || linuxTimer || linuxInput || linuxGen;
   island.classList.toggle('tools-open', linuxTools);
   island.classList.toggle('timer-open', linuxTimer);
+  island.classList.toggle('input-open', linuxInput);
+  island.classList.toggle('gen-open', linuxGen);
   document.body.classList.toggle('linux-tools-open', linuxTools);
   document.body.classList.toggle('linux-timer-open', linuxTimer);
-  const w = (linuxTools || linuxTimer) ? 84 : clamp(Math.ceil(views[cur].offsetWidth), 70, 600);
+  document.body.classList.toggle('linux-input-open', linuxInput);
+  const w = linuxPopover ? 84 : clamp(Math.ceil(views[cur].offsetWidth), 70, 600);
   if (island.dataset.w !== String(w)) {
     island.dataset.w = w;
     island.style.width = w + 'px';
@@ -218,7 +224,7 @@ function hoverNow() {
   if (!inside && st.stackOpen) {
     const s = stackEl.getBoundingClientRect();
     const center = (r.left + r.right) / 2;
-    const fromBottom = activeView && activeView.dataset.view === 'tools' && activeRect
+    const fromBottom = activeView && ['tools', 'timer', 'input', 'gen'].includes(activeView.dataset.view) && activeRect
       ? activeRect.bottom
       : r.bottom;
     const inStack = x >= s.left - 6 && x <= s.right + 6

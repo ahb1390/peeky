@@ -62,7 +62,7 @@ function inputRegions() {
 
     // The Linux action strip is below the face. Keep only a narrow centre
     // corridor between them interactive, not the whole transparent gap.
-    if (activeView.dataset.view === 'tools' || activeView.dataset.view === 'timer') {
+    if (['tools', 'timer', 'input', 'gen'].includes(activeView.dataset.view)) {
       const center = (islandRect.left + islandRect.right) / 2;
       const top = islandRect.bottom - 3;
       const bottom = activeRect.top + 3;
@@ -77,7 +77,7 @@ function inputRegions() {
 
     // Keep a slim path from the face/action strip into the stack. This lets the
     // pointer reach the list without making the full gap across the screen active.
-    const fromBottom = activeView && (activeView.dataset.view === 'tools' || activeView.dataset.view === 'timer') && activeRect
+    const fromBottom = activeView && ['tools', 'timer', 'input', 'gen'].includes(activeView.dataset.view) && activeRect
       ? activeRect.bottom
       : islandRect.bottom;
     const center = (islandRect.left + islandRect.right) / 2;
