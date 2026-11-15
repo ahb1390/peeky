@@ -1176,8 +1176,9 @@ fn shelf_drag_impl(paths: Vec<String>) {
         return;
     };
 
+    let gtk_handle = window.clone();
     let drag_result = window.run_on_main_thread(move || {
-        let Ok(gtk_window) = window.gtk_window() else {
+        let Ok(gtk_window) = gtk_handle.gtk_window() else {
             log("Shelf drag failed: could not access the native GTK window");
             shelf_drag_paths().lock().unwrap().clear();
             emit("shelf-dragging", false);
