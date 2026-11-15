@@ -12,14 +12,17 @@ listen('drop-paths', (e) => { const done = dropWait.get(e.payload.token); if (do
 
 // Wayland does not expose a global pointer query. Send pointer coordinates only while the
 // compositor has routed input to this surface; Rust restricts the idle input region to the pill.
-let displayServer = '';
+let hostPlatform = '';
 invoke('settings_get').then((settings) => {
-  displayServer = settings && settings.displayServer || '';
-  if (displayServer === 'wayland') {
+  hostPlatform = settings && settings.platform || '';
+  // A compact GTK input region lets the WebView receive pointer events only over visible
+  // controls. DOM pointer events therefore work on X11 as well as Wayland, even when the
+  // optional global X11 pointer watcher cannot start.
+  if (hostPlatform === 'linux') {
     let lastCursorUpdate = 0;
     window.addEventListener('pointermove', (event) => {
       const now = performance.now();
-      if (now - lastCursorUpdate < 30) return;
+      if (now - lastCursorUpdate < 24) return;
       lastCursorUpdate = now;
       quiet(invoke('cursor_update', { x: event.clientX, y: event.clientY }));
     }, { passive: true });
@@ -29,6 +32,40 @@ invoke('settings_get').then((settings) => {
   }
 }).catch(() => {});
 
+// Return the union of the visible, interactive surfaces, not the 700x430 transparent
+// WebView. The face, expanded view, open list and side notification remain clickable.
+function inputBounds() {
+  const island = document.getElementById('island');
+  if (!island) return { x: 308, y: 0, width: 84, height: 44 };
+  const elements = [island];
+  const activeView = island.querySelector('.view.on');
+  if (activeView) elements.push(activeView);
+  const stack = document.getElementById('stack');
+  if (stack && stack.classList.contains('open')) elements.push(stack);
+  const side = document.getElementById('side');
+  if (side && side.classList.contains('on')) elements.push(side);
+
+  let left = Infinity, top = Infinity, right = -Infinity, bottom = -Infinity;
+  for (const element of elements) {
+    const rect = element.getBoundingClientRect();
+    if (!Number.isFinite(rect.left) || !Number.isFinite(rect.top) || rect.width <= 0 || rect.height <= 0) continue;
+    left = Math.min(left, rect.left - 2);
+    top = Math.min(top, rect.top - 2);
+    right = Math.max(right, rect.right + 2);
+    bottom = Math.max(bottom, rect.bottom + 2);
+  }
+  left = Math.max(0, left);
+  top = Math.max(0, top);
+  right = Math.min(window.innerWidth, right);
+  bottom = Math.min(window.innerHeight, bottom);
+  if (![left, top, right, bottom].every(Number.isFinite) || right <= left || bottom <= top) {
+    return { x: 308, y: 0, width: 84, height: 44 };
+  }
+  return { x: left, y: top, width: right - left, height: bottom - top };
+}
+
+let inputUpdate = 0, lastIdleRegion = '';
+
 window.qazi = {
   onCursor: on('cursor'), onHelper: on('helper'), onSettings: on('settings'), onClip: on('clip'), onDownload: on('download'),
   onShelf: on('shelf'), onShelfDragging: on('shelf-dragging'), onClips: on('clips'), onLevels: on('levels'),
@@ -36,25 +73,22 @@ window.qazi = {
 
   setInteractive: (v) => {
     const on = !!v;
-    if (!on && displayServer === 'wayland') {
-      // The visible pill is always 84x36 at rest. Its top coordinate moves above the
-      // screen when tucked, so the only active area left is the visible handle.
-      const island = document.getElementById('island');
-      const rect = island && island.getBoundingClientRect();
-      if (rect) {
-        const width = 84, height = 36;
-        return quiet(invoke('set_interactive', {
-          on: false,
-          x: (window.innerWidth - width) / 2,
-          y: rect.top,
-          width,
-          height,
-        }));
-      }
-    }
-    return quiet(invoke('set_interactive', { on }));
+    const seq = ++inputUpdate;
+    requestAnimationFrame(() => {
+      if (seq !== inputUpdate) return;
+      const bounds = inputBounds();
+      const signature = [bounds.x, bounds.y, bounds.width, bounds.height].map((n) => Math.round(n * 2) / 2).join(',');
+      // The active state renews the native watchdog; the idle state only needs to be
+      // sent when its visible hit region actually changes.
+      if (!on && signature === lastIdleRegion) return;
+      if (!on) lastIdleRegion = signature;
+      quiet(invoke('set_interactive', { on, ...bounds }));
+    });
   },
-  setTyping: (v, restore) => invoke('set_typing', { on: !!v, restore: !!restore }).catch(() => ({})),
+  setTyping: (v, restore) => {
+    const on = !!v;
+    return invoke('set_typing', { on, restore: !!restore, ...inputBounds() }).catch(() => ({}));
+  },
   lostClick: (info) => quiet(invoke('lost_click', { info: String(info) })),
 
   media: (cmd) => quiet(invoke('media', { cmd })),
