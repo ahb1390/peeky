@@ -60,6 +60,7 @@ const setIcon = (el, name) => { if (el.dataset.cur !== name) { el.innerHTML = sv
 $$('[data-icon]').forEach((el) => setIcon(el, el.dataset.icon));
 const badge = document.createElement('i'); badge.className = 'badge'; $('#t-inbox').appendChild(badge);
 const shelfBadge = document.createElement('i'); shelfBadge.className = 'badge quiet'; $('#t-shelf').appendChild(shelfBadge);
+const gearBadge = document.createElement('i'); gearBadge.className = 'badge dot'; gearBadge.title = 'An update is ready'; $('#t-gear').appendChild(gearBadge);
 
 // ------------------------------------------------------------ state
 const st = {
@@ -312,6 +313,7 @@ side.addEventListener('click', () => {
     if (n.action === 'dnd') window.qazi.action('dnd');
     else if (n.action === 'download') window.qazi.openDownload(n.path);
     else if (n.action === 'update') window.qazi.updateInstall();
+    else if (n.action === 'whatsnew') window.qazi.openUrl('https://github.com/raminturne/peeky/releases/tag/v' + n.version);
     else if (n.action === 'note') { st.holdUntil = Date.now() + 5000; setStack(true, 'notes'); }
     else if (n.action === 'tour') { st.holdUntil = Date.now() + 9000; st.revealUntil = Date.now() + 9000; setStack(true, 'tour'); }
     else if (n.aumid) { window.qazi.activate(n.id, n.aumid); dropHistory(n.id); }
@@ -355,6 +357,7 @@ views.notif.addEventListener('click', () => {
     if (n.action === 'dnd') window.qazi.action('dnd');
     else if (n.action === 'download') window.qazi.openDownload(n.path);
     else if (n.action === 'update') window.qazi.updateInstall();
+    else if (n.action === 'whatsnew') window.qazi.openUrl('https://github.com/raminturne/peeky/releases/tag/v' + n.version);
     else if (n.action === 'note') { st.holdUntil = Date.now() + 5000; setStack(true, 'notes'); }
     else if (n.action === 'tour') { st.holdUntil = Date.now() + 9000; st.revealUntil = Date.now() + 9000; setStack(true, 'tour'); }
     else if (n.aumid) { window.qazi.activate(n.id, n.aumid); dropHistory(n.id); }
@@ -721,7 +724,12 @@ window.qazi.onHelper((m) => {
     const audio = /bud|pod|head|ear|speaker|sound|audio|jbl|sony|bose|beats|wh-|wf-|anker|jabra/i.test(m.name);
     showHud(audio ? 'headphones' : 'bluetooth', m.name, m.on ? 'Connected' : 'Disconnected', 2600, m.on ? 'blue pop' : 'faded');
   }
-  else if (m.t === 'update') { st.update = m.version; showNotif({ app: 'Update', title: 'Version ' + m.version + ' is ready', body: 'click to install and restart', action: 'update', long: true }); if (st.stackOpen && st.stackKind === 'settings') renderStack(); }
+  else if (m.t === 'update') {
+    st.update = m.version; gearBadge.classList.add('on');
+    showNotif({ app: 'Update', title: 'Version ' + m.version + ' is ready', body: 'click to install now (it also installs by itself when you step away)', action: 'update', long: true });
+    if (st.stackOpen && st.stackKind === 'settings') renderStack();
+  }
+  else if (m.t === 'updated') showNotif({ app: 'Update', title: 'Peeky was updated to ' + m.version, body: "click to see what's new", action: 'whatsnew', version: m.version, long: true });
   else if (m.t === 'net') {
     const was = st.net; st.net = { online: !!m.online, vpn: m.vpn || '', proxy: !!m.proxy }; paintStatus();
     if (m.first) return;
@@ -1813,6 +1821,19 @@ const SETTINGS_UI = [
 function renderSettings() {
   $('#stack-clear').classList.add('hidden');
   const s = st.settings || {};
+  if (st.update) {       // a downloaded update is the first thing here, where it can be seen
+    const row = document.createElement('div'); row.className = 'row set sp upd';
+    const ic = document.createElement('div'); ic.className = 'ic plain'; ic.innerHTML = svg('download');
+    const l = document.createElement('span'); l.className = 'lbl';
+    const b = document.createElement('b'); b.textContent = 'Version ' + st.update + ' is ready';
+    const d = document.createElement('span'); d.className = 'dim';
+    d.textContent = s.autoUpdate !== false ? 'Installs by itself when you step away' : 'Takes a few seconds, then Peeky is back';
+    l.append(b, d);
+    const go = document.createElement('button'); go.className = 'go solid'; go.textContent = 'Install now';
+    go.addEventListener('click', () => { go.textContent = 'Installing…'; window.qazi.updateInstall(); });
+    row.append(ic, l, go);
+    stackList.appendChild(row);
+  }
   SETTINGS_UI.forEach(([type, key, label, a, b, unit], i) => {
     const row = document.createElement('div'); row.className = 'row set'; row.style.setProperty('--i', Math.min(i, 6));
     const l = document.createElement('span'); l.className = 'lbl'; l.textContent = label; row.appendChild(l);
@@ -1835,7 +1856,7 @@ function renderSettings() {
       const box = document.createElement('div'); box.className = 'sws';
       for (const val of a) {
         const bt = document.createElement('button'); bt.className = 'sw-' + val + (val === now ? ' on' : '');
-        bt.title = val === 'sky' ? 'Night sky in the colours of the cover' : val === 'black' ? 'Plain black' : THEMES[val].name;
+        bt.title = val === 'sky' ? 'Violet night sky' : val === 'black' ? 'Plain black' : THEMES[val].name;
         bt.addEventListener('click', () => window.qazi.setSetting(key, val));
         box.appendChild(bt);
       }
@@ -1858,7 +1879,7 @@ function renderSettings() {
     if (st.update) { window.qazi.updateInstall(); return; }
     up.textContent = 'Checking…';
     const r = await window.qazi.updateCheck();
-    if (r.startsWith('ready')) { st.update = r.slice(6); up.textContent = 'Install ' + st.update; }
+    if (r.startsWith('ready')) { st.update = r.slice(6); gearBadge.classList.add('on'); renderStack(); return; }
     else up.textContent = r === 'none' ? 'Up to date' : 'Could not check';
   });
   info.appendChild(up);

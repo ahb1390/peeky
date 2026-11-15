@@ -25,12 +25,27 @@ UninstPage uninstConfirm
 UninstPage instfiles
 
 Section "Install"
-  ; close whatever copy is running, under its current or its earlier name
-  nsExec::Exec 'taskkill /F /T /IM "${EXE}"'
+  ; Close whatever copy is running, under its current or its earlier name. Only the app itself, never its
+  ; process tree: an update is started by the app, so this installer is one of its children (with /T it
+  ; closed itself and the update never happened).
+  nsExec::Exec 'taskkill /F /IM "${EXE}"'
   Pop $0
-  nsExec::Exec 'taskkill /F /T /IM "Qazi Island.exe"'
+  nsExec::Exec 'taskkill /F /IM "Qazi Island.exe"'
   Pop $0
-  Sleep 800
+  ; wait (up to 8 s) until the old file can be replaced
+  StrCpy $1 0
+  free_wait:
+    Sleep 250
+    IfFileExists "$INSTDIR\${EXE}" 0 free_done
+    ClearErrors
+    Delete "$INSTDIR\${EXE}"
+    IfErrors 0 free_done
+    IntOp $1 $1 + 1
+    IntCmp $1 32 free_done
+    nsExec::Exec 'taskkill /F /IM "${EXE}"'
+    Pop $0
+    Goto free_wait
+  free_done:
   ; earlier versions (called Qazi Island) are replaced; their settings and pins are taken over by the app itself
   RMDir /r "$LOCALAPPDATA\Programs\qazi-island"
   RMDir /r "$LOCALAPPDATA\Programs\Qazi Island"
@@ -56,7 +71,7 @@ Section "Install"
 SectionEnd
 
 Section "Uninstall"
-  nsExec::Exec 'taskkill /F /T /IM "${EXE}"'
+  nsExec::Exec 'taskkill /F /IM "${EXE}"'
   Pop $0
   Sleep 600
   Delete "$SMPROGRAMS\${NAME}.lnk"

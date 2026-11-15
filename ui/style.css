@@ -388,3 +388,10 @@ body.daylight #island .sep { background: rgba(24, 34, 47, .25); }
 /* a password step waiting on the pill while another window is used: its icon breathes */
 .parked #in-icon { animation: waiting 1.6s ease-in-out infinite; }
 @keyframes waiting { 50% { opacity: .3; } }
+
+/* ------------------------------------------------ an update waiting: a dot on the gear, a row on top of Settings */
+.badge.dot { min-width: 8px; width: 8px; height: 8px; padding: 0; top: 2px; right: 1px; background: #34d399; box-shadow: 0 0 0 2px #000; }
+.row.set.upd { box-shadow: 0 3px 12px rgba(0, 0, 0, .35), inset 0 0 0 1.5px rgba(52, 211, 153, .55); }
+.row.set.upd .ic.plain { width: 30px; height: 30px; border-radius: 50%; color: #34d399; background-color: rgba(52, 211, 153, .14); }
+.row.set .go.solid { background: #34d399; color: #04130c; font-weight: 600; }
+.row.set .go.solid:hover { background: #fff; color: #000; }

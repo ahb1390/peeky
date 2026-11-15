@@ -1,5 +1,8 @@
 // Updates: now and then the app asks GitHub whether a newer release exists, downloads its installer, checks
-// that it was signed with the project's key, and tells the page. One click then installs it and restarts.
+// that it was signed with the project's key, and tells the page. With "Update automatically" on (the default)
+// it then installs itself at a quiet moment: right after the app has started, or once nobody has touched the
+// computer for a few minutes. Otherwise one click installs it. The next start says what happened.
+use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -7,6 +10,8 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use windows::core::HSTRING;
 use windows::Win32::System::Com::Urlmon::URLDownloadToFileW;
+use windows::Win32::System::SystemInformation::GetTickCount;
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
 
 use crate::{settings, sys};
 
@@ -64,26 +69,76 @@ pub fn check() -> String {
     format!("ready {version}")
 }
 /// Runs the downloaded installer quietly; it closes this copy, replaces it and starts the new one.
+/// It is started through cmd's "start", so it is not this app's child and outlives the app it closes.
 pub fn install() -> bool {
     let Some((v, setup)) = READY.lock().unwrap().clone() else { return false };
     if !signed(&setup, &dir().join("Peeky-Setup.exe.sig")) {
         return false; // the file changed since it was checked
     }
     sys::log(&format!("installing update {v}"));
-    sys::shell_open(&setup.to_string_lossy(), Some("/S"));
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let started = std::process::Command::new("cmd")
+        .raw_arg(format!("/c start \"\" \"{}\" /S", setup.display()))
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .is_ok();
+    if !started {
+        sys::shell_open(&setup.to_string_lossy(), Some("/S"));
+    }
     true
 }
+
+/// How long nobody has pressed a key or moved the mouse, anywhere (ms).
+fn idle_ms() -> u64 {
+    unsafe {
+        let mut li = LASTINPUTINFO { cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };
+        if !GetLastInputInfo(&mut li).as_bool() {
+            return 0;
+        }
+        GetTickCount().wrapping_sub(li.dwTime) as u64
+    }
+}
+/// The first start after an update says so, once.
+fn announce() {
+    let now = env!("CARGO_PKG_VERSION");
+    let before = settings::get("lastVersion").as_str().unwrap_or("").to_string();
+    if before != now {
+        settings::put("lastVersion", now.into());
+        if !before.is_empty() && newer(now, &before) {
+            sys::helper(json!({ "t": "updated", "version": now }));
+        }
+    }
+}
+
+const FRESH: u64 = 3 * 60_000; // the app started this recently: nobody is using it yet
+const AWAY: u64 = 3 * 60_000; // nobody has touched the computer for this long
+const EVERY: u64 = 6 * 3600_000; // how often GitHub is asked
+const RETRY: u64 = 30 * 60_000; // ... and how soon again after it could not be reached
+
 pub fn start() {
     std::thread::spawn(|| {
-        std::thread::sleep(Duration::from_secs(45));
+        let began = sys::now_ms();
+        std::thread::sleep(Duration::from_secs(6)); // the page is listening by now
+        announce();
+        std::thread::sleep(Duration::from_secs(39));
+        let mut next_check = 0u64;
         loop {
-            if settings::packaged() && settings::get("autoUpdate") != Value::Bool(false) {
+            let auto = settings::packaged() && settings::get("autoUpdate") != Value::Bool(false);
+            let now = sys::now_ms();
+            if auto && now >= next_check {
                 let r = check();
+                next_check = now + if r.starts_with("failed") { RETRY } else { EVERY };
                 if r.starts_with("failed") {
                     sys::log(&format!("update check {r}"));
                 }
             }
-            std::thread::sleep(Duration::from_secs(6 * 3600));
+            if auto && READY.lock().unwrap().is_some() {
+                let fresh = sys::now_ms().saturating_sub(began) < FRESH;
+                if (fresh || idle_ms() >= AWAY) && install() {
+                    return; // the installer closes this copy and starts the new one
+                }
+            }
+            std::thread::sleep(Duration::from_secs(20));
         }
     });
 }
