@@ -82,6 +82,21 @@ body.linux-host #island.tools-open .view[data-view="tools"] {
 body.linux-host #island.tools-open .view[data-view="tools"]::-webkit-scrollbar {
   display: none;
 }
+body.linux-host #island.timer-open {
+  overflow: visible;
+}
+body.linux-host #island.timer-open .view[data-view="timer"] {
+  top: 48px;
+  height: 40px;
+  width: max-content;
+  max-width: calc(100vw - 24px);
+  padding: 0 12px;
+  gap: 8px;
+  border-radius: 20px;
+  background: rgba(0, 0, 0, .97);
+  box-shadow: 0 5px 22px rgba(0, 0, 0, .48), inset 0 0 0 1px rgba(255, 255, 255, .12);
+  z-index: 20;
+}
 body.linux-host.linux-tools-open #side {
   top: 104px;
 }

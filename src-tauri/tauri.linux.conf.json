@@ -15,7 +15,13 @@
       "deb": {
         "recommends": [
           "libgtk-layer-shell0",
+          "libsecret-1-0",
           "libsecret-tools",
+          "gnome-keyring",
+          "grim",
+          "slurp",
+          "gnome-screenshot",
+          "spectacle",
           "playerctl",
           "wl-clipboard",
           "xclip",

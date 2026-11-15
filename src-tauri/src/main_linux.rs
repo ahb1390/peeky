@@ -9,7 +9,7 @@ use std::{
     ptr,
     sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Mutex, OnceLock},
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use gtk::glib::object::Cast;
@@ -477,11 +477,36 @@ fn vault_load() {
 
 fn secret_tool_available() -> bool { command_exists("secret-tool") }
 
+fn secret_service_available() -> bool {
+    if !secret_tool_available() { return false; }
+
+    if command_exists("busctl") {
+        if Command::new("busctl")
+            .args(["--user", "status", "org.freedesktop.secrets"])
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+            .status().map(|status| status.success()).unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    if command_exists("gdbus") {
+        return Command::new("gdbus")
+            .args(["introspect", "--session", "--dest", "org.freedesktop.secrets", "--object-path", "/org/freedesktop/secrets"])
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+            .status().map(|status| status.success()).unwrap_or(false);
+    }
+    false
+}
+
 fn vault_payload() -> Value {
+    let locked = !secret_service_available();
+    let items = vault().lock().unwrap();
     json!({
-        "locked": !secret_tool_available(),
-        "items": vault().lock().unwrap().iter().map(|v| json!({
-            "id": v.id, "site": v.site, "user": v.user, "len": secret_lookup(v.id).map(|s| s.chars().count()).unwrap_or(0), "at": v.at
+        "locked": locked,
+        "items": items.iter().map(|v| json!({
+            "id": v.id, "site": v.site, "user": v.user,
+            "len": if locked { 0 } else { secret_lookup(v.id).map(|s| s.chars().count()).unwrap_or(0) },
+            "at": v.at
         })).collect::<Vec<_>>()
     })
 }
@@ -493,9 +518,29 @@ fn secret_store(id: u64, secret: &str, label: &str) -> bool {
             Ok(c) => c, Err(_) => return false,
         };
     if let Some(mut stdin) = child.stdin.take() {
-        if stdin.write_all(secret.as_bytes()).is_err() { let _ = child.kill(); return false; }
+        if stdin.write_all(secret.as_bytes()).is_err() {
+            let _ = child.kill();
+            return false;
+        }
     }
-    child.wait().map(|s| s.success()).unwrap_or(false)
+
+    // Secret Service can wait for an unlock prompt. Never let a missing desktop
+    // keyring agent block Peeky's UI command forever.
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if started.elapsed() < Duration::from_secs(12) => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                log("Secret Service store timed out or could not be reached");
+                return false;
+            }
+        }
+    }
 }
 
 fn secret_lookup(id: u64) -> Option<String> {
@@ -505,7 +550,7 @@ fn secret_lookup(id: u64) -> Option<String> {
 fn vault_save_impl(site: &str, user: &str, pass: &str) -> u64 {
     let site = site.trim();
     let user = user.trim();
-    if pass.is_empty() || pass.len() > 1000 || site.len() > 300 || user.len() > 300 || !secret_tool_available() {
+    if pass.is_empty() || pass.len() > 1000 || site.len() > 300 || user.len() > 300 || !secret_service_available() {
         return 0;
     }
     let mut items = vault().lock().unwrap();
@@ -535,7 +580,7 @@ fn vault_edit_impl(id: u64, site: &str, user: &str) -> bool {
 }
 
 fn vault_remove_impl(id: u64) -> bool {
-    if !secret_tool_available() { return false; }
+    if !secret_service_available() { return false; }
     let _ = Command::new("secret-tool").args(["clear", "application", "peeky", "entry", &id.to_string()])
         .stdout(Stdio::null()).stderr(Stdio::null()).status();
     let mut items = vault().lock().unwrap();
@@ -785,41 +830,126 @@ fn screenshot_path() -> PathBuf {
     dir.join(format!("capture-{}.png", now_ms()))
 }
 
-fn capture_selection() -> Option<Vec<u8>> {
-    let dest = screenshot_path();
-    let ok = if is_wayland() {
-        let geometry = output("slurp", &[])?;
-        Command::new("grim").args(["-g", &geometry]).arg(&dest)
-            .stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false)
-    } else if command_exists("flameshot") {
-        Command::new("flameshot").arg("gui").arg("--path").arg(&dest)
-            .stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false)
-    } else if command_exists("gnome-screenshot") {
-        Command::new("gnome-screenshot").args(["-a", "-f"]).arg(&dest)
-            .stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false)
-    } else if command_exists("maim") {
-        Command::new("maim").arg("-s").arg(&dest)
-            .stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false)
-    } else {
-        false
-    };
-    let bytes = if ok { fs::read(&dest).ok() } else { None };
-    let _ = fs::remove_file(dest);
-    bytes
+fn run_capture_command(mut command: Command, dest: &Path, tool: &str) -> Result<Vec<u8>, String> {
+    let status = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("Could not start {tool}: {error}"))?;
+    if !status.success() {
+        return Err(format!("{tool} did not complete the capture"));
+    }
+    fs::read(dest).map_err(|error| format!("{tool} did not create a readable screenshot: {error}"))
 }
 
-fn capture_fullscreen() -> Option<Vec<u8>> {
+fn capture_selection_slurp(dest: &Path) -> Result<Vec<u8>, String> {
+    if !command_exists("slurp") || !command_exists("grim") {
+        return Err("For this Wayland session install grim and slurp, or use the desktop screenshot tool".into());
+    }
+    let selection = Command::new("slurp")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|error| format!("Could not start slurp: {error}"))?;
+    if !selection.status.success() {
+        return Err("Selection cancelled".into());
+    }
+    let geometry = String::from_utf8_lossy(&selection.stdout).trim().to_string();
+    if geometry.is_empty() {
+        return Err("Selection cancelled".into());
+    }
+    let mut command = Command::new("grim");
+    command.args(["-g", &geometry]).arg(dest);
+    run_capture_command(command, dest, "grim")
+}
+
+fn desktop_name() -> String {
+    std::env::var("XDG_CURRENT_DESKTOP")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
+fn capture_selection() -> Result<Vec<u8>, String> {
     let dest = screenshot_path();
-    let ok = if is_wayland() && command_exists("grim") {
-        Command::new("grim").arg(&dest).status().map(|s| s.success()).unwrap_or(false)
+    let desktop = desktop_name();
+    let result = if is_wayland() {
+        if desktop.contains("kde") && command_exists("spectacle") {
+            let mut command = Command::new("spectacle");
+            command.args(["--region", "--background", "--nonotify", "--output"]).arg(&dest);
+            run_capture_command(command, &dest, "Spectacle")
+        } else if desktop.contains("gnome") && command_exists("gnome-screenshot") {
+            let mut command = Command::new("gnome-screenshot");
+            command.args(["--area", "--file"]).arg(&dest);
+            run_capture_command(command, &dest, "GNOME Screenshot")
+        } else if command_exists("grim") && command_exists("slurp") {
+            capture_selection_slurp(&dest)
+        } else if command_exists("spectacle") {
+            let mut command = Command::new("spectacle");
+            command.args(["--region", "--background", "--nonotify", "--output"]).arg(&dest);
+            run_capture_command(command, &dest, "Spectacle")
+        } else if command_exists("gnome-screenshot") {
+            let mut command = Command::new("gnome-screenshot");
+            command.args(["--area", "--file"]).arg(&dest);
+            run_capture_command(command, &dest, "GNOME Screenshot")
+        } else {
+            Err("No Wayland selector is installed. Install grim + slurp, GNOME Screenshot, or Spectacle".into())
+        }
+    } else if command_exists("flameshot") {
+        let mut command = Command::new("flameshot");
+        command.args(["gui", "--path"]).arg(&dest);
+        run_capture_command(command, &dest, "Flameshot")
     } else if command_exists("gnome-screenshot") {
-        Command::new("gnome-screenshot").arg("-f").arg(&dest).status().map(|s| s.success()).unwrap_or(false)
+        let mut command = Command::new("gnome-screenshot");
+        command.args(["--area", "--file"]).arg(&dest);
+        run_capture_command(command, &dest, "GNOME Screenshot")
+    } else if command_exists("spectacle") {
+        let mut command = Command::new("spectacle");
+        command.args(["--region", "--background", "--nonotify", "--output"]).arg(&dest);
+        run_capture_command(command, &dest, "Spectacle")
     } else if command_exists("maim") {
-        Command::new("maim").arg(&dest).status().map(|s| s.success()).unwrap_or(false)
-    } else { false };
-    let bytes = if ok { fs::read(&dest).ok() } else { None };
-    let _ = fs::remove_file(dest);
-    bytes
+        let mut command = Command::new("maim");
+        command.arg("-s").arg(&dest);
+        run_capture_command(command, &dest, "maim")
+    } else {
+        Err("No X11 screen selector is installed. Install Flameshot, GNOME Screenshot, Spectacle, or maim".into())
+    };
+    let _ = fs::remove_file(&dest);
+    result
+}
+
+fn capture_fullscreen() -> Result<Vec<u8>, String> {
+    let dest = screenshot_path();
+    let desktop = desktop_name();
+    let result = if is_wayland() && desktop.contains("kde") && command_exists("spectacle") {
+        let mut command = Command::new("spectacle");
+        command.args(["--fullscreen", "--background", "--nonotify", "--output"]).arg(&dest);
+        run_capture_command(command, &dest, "Spectacle")
+    } else if is_wayland() && desktop.contains("gnome") && command_exists("gnome-screenshot") {
+        let mut command = Command::new("gnome-screenshot");
+        command.args(["--file"]).arg(&dest);
+        run_capture_command(command, &dest, "GNOME Screenshot")
+    } else if is_wayland() && command_exists("grim") {
+        let mut command = Command::new("grim");
+        command.arg(&dest);
+        run_capture_command(command, &dest, "grim")
+    } else if command_exists("spectacle") {
+        let mut command = Command::new("spectacle");
+        command.args(["--fullscreen", "--background", "--nonotify", "--output"]).arg(&dest);
+        run_capture_command(command, &dest, "Spectacle")
+    } else if command_exists("gnome-screenshot") {
+        let mut command = Command::new("gnome-screenshot");
+        command.args(["--file"]).arg(&dest);
+        run_capture_command(command, &dest, "GNOME Screenshot")
+    } else if command_exists("maim") {
+        let mut command = Command::new("maim");
+        command.arg(&dest);
+        run_capture_command(command, &dest, "maim")
+    } else {
+        Err("No full-screen capture tool is installed. Install grim, GNOME Screenshot, Spectacle, or maim".into())
+    };
+    let _ = fs::remove_file(&dest);
+    result
 }
 
 fn clipboard_write_png(bytes: &[u8]) -> bool {
@@ -841,7 +971,7 @@ fn clipboard_write_png(bytes: &[u8]) -> bool {
 
 fn ocr_start() {
     match capture_selection() {
-        Some(png) => {
+        Ok(png) => {
             let encoded = {
                 const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
                 let mut out = String::with_capacity((png.len() + 2) / 3 * 4);
@@ -856,7 +986,7 @@ fn ocr_start() {
             };
             emit("ocr-read", json!({ "png": encoded }));
         }
-        None => emit("ocr", json!({ "ok": false, "why": if is_wayland() { "Install grim and slurp for Wayland screen selection" } else { "Install flameshot or gnome-screenshot for screen selection" } })),
+        Err(why) => emit("ocr", json!({ "ok": false, "why": why })),
     }
 }
 
@@ -1437,9 +1567,14 @@ fn settings_set(key: String, value: Value) { settings_apply(&key, &value); }
 fn action(name: String) {
     match name.as_str() {
         "screenshot" => {
-            if let Some(png) = capture_fullscreen() {
-                if clipboard_write_png(&png) { emit("clip", json!({ "kind": "image" })); }
-            } else { log("No supported screenshot tool was found"); }
+            match capture_fullscreen() {
+                Ok(png) if clipboard_write_png(&png) => emit("clip", json!({ "kind": "image" })),
+                Ok(_) => emit("helper", json!({ "t": "capture-error", "message": "Could not put the screenshot on the clipboard. Check wl-clipboard or xclip." })),
+                Err(why) => {
+                    log(&format!("Screenshot failed: {why}"));
+                    emit("helper", json!({ "t": "capture-error", "message": why }));
+                }
+            }
         }
         "dnd" => {
             if command_exists("gnome-control-center") { let _ = Command::new("gnome-control-center").arg("notifications").spawn(); }
