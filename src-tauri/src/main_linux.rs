@@ -35,7 +35,6 @@ static VAULT: OnceLock<Mutex<Vec<VaultItem>>> = OnceLock::new();
 static CLIPS: OnceLock<Mutex<Vec<ClipEntry>>> = OnceLock::new();
 static SHELF: OnceLock<Mutex<Vec<ShelfItem>>> = OnceLock::new();
 static LAST_CLIPBOARD: OnceLock<Mutex<String>> = OnceLock::new();
-static WAYLAND_LAYER_ACTIVE: AtomicBool = AtomicBool::new(false);
 static X11_POINTER_ACTIVE: AtomicBool = AtomicBool::new(false);
 static INPUT_INTERACTIVE: AtomicBool = AtomicBool::new(false);
 static INPUT_HEARTBEAT: AtomicU64 = AtomicU64::new(0);
@@ -1112,6 +1111,9 @@ fn apply_wayland_input_region(
                 let region = Region::create_rectangle(&rect);
                 gtk_window.input_shape_combine_region(Some(&region));
             }
+            // The GTK 3 Wayland backend commits pending input-region changes during paint.
+            // Queue a redraw so click-through changes take effect even while the pill is idle.
+            gtk_window.queue_draw();
         }
     });
 }
@@ -1124,10 +1126,9 @@ fn set_input_interactive(
     INPUT_INTERACTIVE.store(on, Ordering::SeqCst);
     INPUT_HEARTBEAT.store(now_ms(), Ordering::SeqCst);
     if is_wayland() {
-        if WAYLAND_LAYER_ACTIVE.load(Ordering::SeqCst) {
-            apply_wayland_input_region(window, on, idle_region);
-        }
-        // On compositors without layer-shell, keep the ordinary decorated window interactive.
+        // Apply the same compact input region with and without layer-shell. The fallback
+        // decorated window must not capture clicks across its full transparent 700x430 area.
+        apply_wayland_input_region(window, on, idle_region);
     } else if X11_POINTER_ACTIVE.load(Ordering::SeqCst) {
         if let Err(error) = window.set_ignore_cursor_events(!on) {
             log(&format!("set_ignore_cursor_events failed: {error}"));
@@ -1626,7 +1627,6 @@ fn main() {
             // top-layer, top-centred surface. GNOME's default Wayland compositor does not expose
             // this protocol, so it gets a conventional, movable application window instead.
             let layer_shell = is_wayland() && gtk_layer_shell::is_supported();
-            WAYLAND_LAYER_ACTIVE.store(layer_shell, Ordering::SeqCst);
             if is_wayland() && !layer_shell {
                 log("This Wayland compositor has no layer-shell protocol; using a regular desktop window");
             }
@@ -1668,13 +1668,11 @@ fn main() {
             }
 
             let _ = window.show();
-            if layer_shell {
+            if is_wayland() {
+                // Restrict even the ordinary decorated fallback window to the visible pill.
                 apply_wayland_input_region(window.clone(), false, None);
-            } else if !is_wayland() {
-                let _ = window.set_ignore_cursor_events(true);
             } else {
-                // GNOME and other non-layer-shell Wayland desktops use a regular window.
-                let _ = window.set_ignore_cursor_events(false);
+                let _ = window.set_ignore_cursor_events(true);
             }
 
             create_tray(app)?;
