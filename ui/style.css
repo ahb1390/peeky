@@ -82,11 +82,11 @@ body.linux-host #island.tools-open .view[data-view="tools"] {
 body.linux-host #island.tools-open .view[data-view="tools"]::-webkit-scrollbar {
   display: none;
 }
-body.linux-host.linux-tools-open #stack {
-  top: 104px;
-}
 body.linux-host.linux-tools-open #side {
   top: 104px;
+}
+body.linux-host.linux-tools-open #stack {
+  top: 140px;
 }
 
 
