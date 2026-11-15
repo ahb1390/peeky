@@ -1655,7 +1655,8 @@ fn main() {
                     gtk_window.init_layer_shell();
                     gtk_window.set_layer(Layer::Top);
                     gtk_window.set_anchor(Edge::Top, true);
-                    gtk_window.set_layer_shell_margin(Edge::Top, 8);
+                    // CSS positions the pill 8px below the surface origin; do not add a second layer margin.
+                    gtk_window.set_layer_shell_margin(Edge::Top, 0);
                     gtk_window.set_exclusive_zone(-1);
                     gtk_window.set_keyboard_mode(KeyboardMode::OnDemand);
                     gtk_window.set_namespace("peeky");
