@@ -108,7 +108,7 @@ let cur = 'idle';
 // The idle face is a real activation target on Linux. This is also the fallback when a
 // compositor or X11 pointer watcher does not deliver global hover updates after relaunch.
 island.addEventListener('click', (event) => {
-  if (cur !== 'idle' || st.tucked) return;
+  if (st.settings.platform !== 'linux' || cur !== 'idle' || st.tucked) return;
   if (event.target.closest('button, input, a, .row')) return;
   st.hover = true;
   st.enteredAt = Date.now() - 200;
