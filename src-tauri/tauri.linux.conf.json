@@ -1,0 +1,29 @@
+{
+  "bundle": {
+    "active": true,
+    "targets": ["deb"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png"
+    ],
+    "category": "Utility",
+    "shortDescription": "A small dynamic desktop island",
+    "longDescription": "Peeky brings media controls, clipboard history, notes, a file shelf and desktop helpers into a compact desktop island.",
+    "linux": {
+      "deb": {
+        "recommends": [
+          "libgtk-layer-shell0",
+          "libsecret-tools",
+          "playerctl",
+          "wl-clipboard",
+          "xclip",
+          "xsel",
+          "xdotool",
+          "curl"
+        ]
+      }
+    }
+  }
+}

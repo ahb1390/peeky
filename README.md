@@ -51,6 +51,37 @@ Windows 10 or 11 with the WebView2 runtime (already part of Windows 11 and of cu
 
 The installer is not code-signed, so Windows SmartScreen may ask once whether to run it.
 
+## Install on Linux
+
+Download the `peeky_2.1.2_amd64.deb` asset from the GitHub release and install it with:
+
+```sh
+sudo apt install ./peeky_2.1.2_amd64.deb
+```
+
+For a local build, after installing `python3-pil`, run:
+
+```sh
+python3 - <<'PY'
+from PIL import Image
+from pathlib import Path
+source = Image.open('src-tauri/icons/icon.ico').convert('RGBA')
+for name, size in [('32x32.png', 32), ('128x128.png', 128), ('128x128@2x.png', 256), ('icon.png', 512)]:
+    source.resize((size, size), Image.Resampling.LANCZOS).save(Path('src-tauri/icons') / name)
+PY
+cd src-tauri
+cargo tauri build --release --bundles deb
+```
+
+The package is built for Debian 12+ and Ubuntu 22.04+ (x86_64). The GitHub build generates the Linux PNG icon sizes from the project's existing ICO file. For a local package build, install `python3-pil` and generate the icon files first. Optional desktop helpers:
+
+- X11 pointer tracking: `xdotool`
+- Wayland screenshots: `grim` and `slurp`
+- X11 screenshots: `flameshot` or `gnome-screenshot`
+- Password storage: `libsecret-tools` and an unlocked Secret Service provider (GNOME Keyring or KWallet)
+- Media controls: `playerctl`
+- Volume: `wpctl` (PipeWire) or `pactl` (PulseAudio)
+
 ## Privacy
 
 Peeky makes no network requests except checking this repository for a new release (which can be switched off).
@@ -68,8 +99,11 @@ Every push is built by [GitHub Actions](.github/workflows/build.yml); a tag `vX.
 
 ## Platforms
 
-Windows today. A Linux version is being worked on; the backend talks to Windows directly for almost everything
-(notifications, media session, clipboard, the click-through window), so it is a port, not a rebuild.
+- **Windows 10/11:** native Windows backend, WebView2.
+- **Linux (Debian 12+, Ubuntu 22.04+):** native GTK/WebKitGTK backend. X11 supports click-through hover with `xdotool`; global shortcuts use the X11 shortcut service. Wayland uses layer-shell on compositors that implement `wlr-layer-shell`; other Wayland desktops run Peeky as a regular movable window.
+- Linux uses MPRIS/`playerctl` for media, PipeWire/`wpctl` or PulseAudio/`pactl` for volume, XDG Autostart, XDG data/config locations, and Secret Service (`secret-tool`) for the password vault.
+
+Wayland global shortcuts, notification-history access, fullscreen-app detection, live audio visualisation, automatic updates and dragging files back out of the shelf are not implemented in this first Linux port. The Linux clipboard history currently stores text entries only. Wayland click-through and top placement require a compositor with wlr-layer-shell; other Wayland desktops use a regular movable window.
 
 ## License
 
@@ -103,6 +137,17 @@ Windows today. A Linux version is being worked on; the backend talks to Windows 
 
 فایل **[Peeky-Setup.exe](https://github.com/raminturne/peeky/releases/latest/download/Peeky-Setup.exe)** را دانلود و اجرا کن.
 فقط برای کاربر فعلی نصب می‌شود و دسترسی ادمین نمی‌خواهد.
+
+### نصب در لینوکس
+
+از بخش Releases فایل `.deb` را بگیر و با این دستور نصب کن:
+
+```sh
+sudo apt install ./peeky_2.1.2_amd64.deb
+```
+
+این بسته برای Debian 12 به بعد و Ubuntu 22.04 به بعد، معماری x86_64 ساخته می‌شود.
+در X11 برای تشخیص موقعیت نشانگر و click-through به `xdotool` نیاز است. در Wayland، حالت جزیرهٔ شناور روی compositorهایی فعال می‌شود که پروتکل `wlr-layer-shell` را پشتیبانی کنند؛ در بقیهٔ محیط‌ها برنامه به شکل پنجرهٔ معمولی اجرا می‌شود.
 
 ### حریم خصوصی
 

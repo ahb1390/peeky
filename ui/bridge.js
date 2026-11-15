@@ -10,6 +10,23 @@ let dropSeq = 0;
 const dropWait = new Map();
 listen('drop-paths', (e) => { const done = dropWait.get(e.payload.token); if (done) { dropWait.delete(e.payload.token); done(e.payload.paths || []); } });
 
+// Wayland does not expose a global pointer query. Send pointer coordinates only while the
+// compositor has routed input to this surface; Rust restricts the idle input region to the pill.
+invoke('settings_get').then((settings) => {
+  if (settings && settings.displayServer === 'wayland') {
+    let lastCursorUpdate = 0;
+    window.addEventListener('pointermove', (event) => {
+      const now = performance.now();
+      if (now - lastCursorUpdate < 30) return;
+      lastCursorUpdate = now;
+      quiet(invoke('cursor_update', { x: event.clientX, y: event.clientY }));
+    }, { passive: true });
+    window.addEventListener('pointerleave', () => {
+      quiet(invoke('cursor_update', { x: -1000, y: -1000 }));
+    }, { passive: true });
+  }
+}).catch(() => {});
+
 window.qazi = {
   onCursor: on('cursor'), onHelper: on('helper'), onSettings: on('settings'), onClip: on('clip'), onDownload: on('download'),
   onShelf: on('shelf'), onShelfDragging: on('shelf-dragging'), onClips: on('clips'), onLevels: on('levels'),
