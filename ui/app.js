@@ -123,8 +123,11 @@ const musicOn = () => st.media.active && !(st.hideVideo && (st.media.video || st
 function pickView() {
   const now = Date.now();
   if (st.force) return st.force;
-  if (st.manual === 'timer' || timer.running) return 'timer';
+  // Text entry and password generation must be able to temporarily cover a running
+  // timer. The countdown keeps using endAt and returns to the pill when the prompt ends.
   if (st.typing) return 'input';
+  if (st.manual === 'gen') return 'gen';
+  if (st.manual === 'timer' || timer.running) return 'timer';
   if (dragging()) return 'drop';
   if (st.notif) return 'notif';
   if (now < st.volUntil) return 'vol';
