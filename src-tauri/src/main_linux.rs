@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     ptr,
-    sync::{atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering}, Mutex, OnceLock},
+    sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Mutex, OnceLock},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -48,7 +48,6 @@ static INPUT_HEARTBEAT: AtomicU64 = AtomicU64::new(0);
 static TYPING_ACTIVE: AtomicBool = AtomicBool::new(false);
 static VIZ_ACTIVE: AtomicBool = AtomicBool::new(false);
 static VIZ_STARTED: AtomicBool = AtomicBool::new(false);
-static VIZ_PID: AtomicU32 = AtomicU32::new(0);
 static PREVIOUS_X11_WINDOW: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 fn previous_x11_window() -> &'static Mutex<Option<String>> {
@@ -1561,11 +1560,31 @@ fn sensor_snapshot() -> (Vec<String>, Vec<String>) {
     }
 }
 
-fn net_state() -> bool {
-    fs::read_dir("/sys/class/net").ok().map(|entries| entries.flatten().any(|entry| {
-        let name = entry.file_name().to_string_lossy().to_string();
-        name != "lo" && fs::read_to_string(entry.path().join("operstate")).map(|s| s.trim() == "up").unwrap_or(false)
-    })).unwrap_or(false)
+fn net_state() -> (bool, String, bool) {
+    let mut online = false;
+    let mut vpn = String::new();
+    if let Ok(entries) = fs::read_dir("/sys/class/net") {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == "lo" { continue; }
+            let up = fs::read_to_string(entry.path().join("operstate"))
+                .map(|s| s.trim() == "up").unwrap_or(false);
+            if !up { continue; }
+            online = true;
+            let lower = name.to_ascii_lowercase();
+            let looks_vpn = ["tun", "tap", "wg", "tailscale", "zt", "warp", "hiddify", "sing", "xray", "vpn", "proton"]
+                .iter().any(|word| lower.starts_with(word) || lower.contains(word));
+            if looks_vpn && vpn.is_empty() { vpn = name; }
+        }
+    }
+
+    let has_proxy_env = [
+        "http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+    ].iter().any(|key| std::env::var(key).map(|v| !v.trim().is_empty()).unwrap_or(false));
+    let desktop_proxy = output("gsettings", &["get", "org.gnome.system.proxy", "mode"])
+        .map(|mode| mode.trim_matches('\'').trim() != "none")
+        .unwrap_or(false);
+    (online, vpn, has_proxy_env || desktop_proxy)
 }
 
 fn x11_window_geometry(id: &str) -> Option<(i32, i32, i32, i32)> {
@@ -1655,7 +1674,7 @@ fn x11_cover_state(last_external: &mut Option<String>) -> Option<(bool, bool)> {
 fn poll_start() {
     thread::spawn(|| {
         let mut previous_media = Value::Null;
-        let mut last_online: Option<bool> = None;
+        let mut last_network: Option<(bool, String, bool)> = None;
         let mut last_volume = String::new();
         let mut net_tick = 0u8;
         let mut volume_tick = 0u8;
@@ -1697,14 +1716,16 @@ fn poll_start() {
                     last_volume = key;
                     emit("helper", json!({ "t": "vol", "level": level, "mute": mute }));
                 }
-                emit("levels", vec![0.0f32; 24]);
             }
             if net_tick >= 20 {
                 net_tick = 0;
-                let online = net_state();
-                if last_online != Some(online) {
-                    emit("helper", json!({ "t": "net", "online": online, "vpn": "", "proxy": std::env::var_os("http_proxy").is_some() || std::env::var_os("https_proxy").is_some(), "first": last_online.is_none() }));
-                    last_online = Some(online);
+                let network = net_state();
+                if last_network.as_ref() != Some(&network) {
+                    emit("helper", json!({
+                        "t": "net", "online": network.0, "vpn": network.1, "proxy": network.2,
+                        "first": last_network.is_none()
+                    }));
+                    last_network = Some(network);
                 }
             }
             if bluetooth_tick >= 12 {
@@ -2141,11 +2162,9 @@ fn visualizer_capture() -> bool {
             return false;
         }
     };
-    VIZ_PID.store(child.id(), Ordering::SeqCst);
     let Some(stdout) = child.stdout.as_mut() else {
         let _ = child.kill();
         let _ = child.wait();
-        VIZ_PID.store(0, Ordering::SeqCst);
         return false;
     };
     let fd = stdout.as_raw_fd();
@@ -2215,7 +2234,6 @@ fn visualizer_capture() -> bool {
 
     let _ = child.kill();
     let _ = child.wait();
-    VIZ_PID.store(0, Ordering::SeqCst);
     emit("levels", vec![0.0f32; VIZ_BANDS]);
     true
 }

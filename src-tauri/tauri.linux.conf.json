@@ -24,6 +24,8 @@
           "spectacle",
           "playerctl",
           "pulseaudio-utils",
+          "pipewire-bin",
+          "bluez",
           "wl-clipboard",
           "xclip",
           "xsel",
