@@ -1917,7 +1917,7 @@ fn fft(re: &mut [f32], im: &mut [f32]) {
             let (mut cr, mut ci) = (1.0f32, 0.0f32);
             for k in 0..half {
                 let (a, b) = (i + k, i + k + half);
-                let (vr, vi) = (re[b] * cr - im[b] * ci, re[b] * cr * 0.0 + im[b] * cr + re[b] * ci);
+                let (vr, vi) = (re[b] * cr - im[b] * ci, re[b] * ci + im[b] * cr);
                 let (ur, ui) = (re[a], im[a]);
                 re[a] = ur + vr;
                 im[a] = ui + vi;
@@ -1982,7 +1982,6 @@ fn visualizer_capture() -> bool {
             break;
         }
         if ready == 0 {
-            if child.try_wait().ok().flatten().is_some() { break; }
             continue;
         }
         if descriptor.revents & (0x08 | 0x10) != 0 { // error or hangup
