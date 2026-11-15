@@ -1275,7 +1275,7 @@ fn create_tray(app: &tauri::App) -> tauri::Result<()> {
         .text("restart", "Restart")
         .separator()
         .text("quit", "Quit")
-        .build(app)?;
+        .build()?;
     TrayIconBuilder::with_id("main")
         .icon(tauri::image::Image::new_owned(tray_rgba(), 32, 32))
         .tooltip(APP_NAME)
