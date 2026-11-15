@@ -60,6 +60,36 @@ button { font: inherit; color: inherit; background: none; border: 0; cursor: poi
 }
 .view.on { opacity: 1; transform: translateX(-50%); filter: none; pointer-events: auto; transition-delay: .09s; }
 
+/* Linux keeps the trigger compact at the top edge. Its action strip opens below it,
+   leaving browser tabs and neighbouring desktop controls unobstructed. */
+body.linux-host #island.tools-open {
+  overflow: visible;
+}
+body.linux-host #island.tools-open .view[data-view="tools"] {
+  top: 48px;
+  height: 40px;
+  max-width: calc(100vw - 24px);
+  padding: 0 12px;
+  gap: 6px;
+  border-radius: 20px;
+  background: rgba(0, 0, 0, .97);
+  box-shadow: 0 5px 22px rgba(0, 0, 0, .48), inset 0 0 0 1px rgba(255, 255, 255, .12);
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  z-index: 20;
+}
+body.linux-host #island.tools-open .view[data-view="tools"]::-webkit-scrollbar {
+  display: none;
+}
+body.linux-host.linux-tools-open #stack {
+  top: 104px;
+}
+body.linux-host.linux-tools-open #side {
+  top: 104px;
+}
+
+
 .dim { color: var(--dim); font-size: 12px; }
 .strong { font-weight: 600; }
 .sep { width: 1px; height: 14px; background: rgba(255, 255, 255, .16); margin: 0 1px; }
