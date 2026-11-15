@@ -105,6 +105,18 @@ const timer = { left: 25 * 60000, endAt: 0, running: false, done: false };
 const views = Object.fromEntries($$('.view').map((v) => [v.dataset.view, v]));
 let cur = 'idle';
 
+// The idle face is a real activation target on Linux. This is also the fallback when a
+// compositor or X11 pointer watcher does not deliver global hover updates after relaunch.
+island.addEventListener('click', (event) => {
+  if (cur !== 'idle' || st.tucked) return;
+  if (event.target.closest('button, input, a, .row')) return;
+  st.hover = true;
+  st.enteredAt = Date.now() - 200;
+  st.leftAt = 0;
+  syncMouse(true);
+  render();
+});
+
 // music counts only when it is not a video and nothing is running fullscreen (a film, a game)
 const musicOn = () => st.media.active && !(st.hideVideo && (st.media.video || st.full));
 
@@ -162,7 +174,12 @@ function render() {
     views[v].classList.add('on');
     cur = v;
   }
-  const w = clamp(Math.ceil(views[cur].offsetWidth), 70, 600);
+  // On Linux the action strip is a drop-down under the small face, not a 600px-wide
+  // bar across the browser's tab row. Windows keeps the original expanding-pill layout.
+  const linuxTools = st.settings.platform === 'linux' && cur === 'tools';
+  island.classList.toggle('tools-open', linuxTools);
+  document.body.classList.toggle('linux-tools-open', linuxTools);
+  const w = linuxTools ? 84 : clamp(Math.ceil(views[cur].offsetWidth), 70, 600);
   if (island.dataset.w !== String(w)) {
     island.dataset.w = w;
     island.style.width = w + 'px';
@@ -1957,6 +1974,7 @@ window.qazi.onCursor(({ x, y }) => {
 let hinted = false, toured = false;
 const applySettings = (s) => {
   if (!s) return;
+  document.body.classList.toggle('linux-host', s.platform === 'linux');
   st.autoHide = s.autoHide !== false;
   st.hideVideo = s.hideVideo !== false;
   st.notifMs = clamp(Number(s.notifSeconds) || 4, 2, 15) * 1000;
