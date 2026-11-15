@@ -1,7 +1,9 @@
 {
   "bundle": {
     "active": true,
-    "targets": ["deb"],
+    "targets": [
+      "deb"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -15,7 +17,9 @@
       "deb": {
         "depends": [
           "wl-clipboard",
-          "xclip"
+          "xclip",
+          "xdotool",
+          "gnome-screenshot"
         ],
         "recommends": [
           "libgtk-layer-shell0",
@@ -24,16 +28,12 @@
           "gnome-keyring",
           "grim",
           "slurp",
-          "gnome-screenshot",
           "spectacle",
           "playerctl",
           "pulseaudio-utils",
           "pipewire-bin",
           "bluez",
-          "wl-clipboard",
-          "xclip",
           "xsel",
-          "xdotool",
           "curl"
         ]
       }

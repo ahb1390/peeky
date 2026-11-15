@@ -36,7 +36,6 @@ const WIN_H: f64 = 430.0;
 const MAX_SHELF_BYTES: usize = 200 * 1024 * 1024;
 
 static APP: OnceLock<tauri::AppHandle> = OnceLock::new();
-static GTK_MAIN_THREAD_ID: OnceLock<thread::ThreadId> = OnceLock::new();
 static SETTINGS: OnceLock<Mutex<Map<String, Value>>> = OnceLock::new();
 static NOTES: OnceLock<Mutex<Vec<Note>>> = OnceLock::new();
 static VAULT: OnceLock<Mutex<Vec<VaultItem>>> = OnceLock::new();
@@ -45,6 +44,7 @@ static SHELF: OnceLock<Mutex<Vec<ShelfItem>>> = OnceLock::new();
 static SHELF_DRAG_PATHS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 static SHELF_DRAG_HOOKED: AtomicBool = AtomicBool::new(false);
 static LAST_CLIPBOARD: OnceLock<Mutex<String>> = OnceLock::new();
+static CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static X11_POINTER_ACTIVE: AtomicBool = AtomicBool::new(false);
 static X11_LIB: OnceLock<x11_dl::xlib::Xlib> = OnceLock::new();
 static INPUT_INTERACTIVE: AtomicBool = AtomicBool::new(false);
@@ -122,105 +122,6 @@ fn log(message: &str) {
     if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(file, "[{}] {}", now_ms(), message);
     }
-}
-
-// GTK owns the desktop clipboard on both X11 and Wayland. Run clipboard operations on
-// GTK's UI thread so image/text support does not depend on wl-clipboard or xclip.
-fn gtk_main_call<T, F>(task: F) -> Option<T>
-where
-    T: Send + 'static,
-    F: FnOnce() -> T + Send + 'static,
-{
-    if GTK_MAIN_THREAD_ID
-        .get()
-        .is_some_and(|main_id| *main_id == thread::current().id())
-    {
-        return Some(task());
-    }
-
-    let Some(app) = APP.get() else {
-        log("Clipboard GTK fallback failed: the Tauri application handle is unavailable");
-        return None;
-    };
-    let Some(window) = app.get_webview_window("main") else {
-        log("Clipboard GTK fallback failed: the main GTK window is unavailable");
-        return None;
-    };
-    let (sender, receiver) = mpsc::sync_channel(1);
-    if let Err(error) = window.run_on_main_thread(move || {
-        let value = task();
-        let _ = sender.send(value);
-    }) {
-        log(&format!("Clipboard GTK fallback could not enter the GTK main thread: {error}"));
-        return None;
-    }
-    match receiver.recv_timeout(Duration::from_secs(4)) {
-        Ok(value) => Some(value),
-        Err(error) => {
-            log(&format!("Clipboard GTK fallback timed out on the GTK main thread: {error}"));
-            None
-        }
-    }
-}
-
-fn gtk_clipboard_read_text() -> Option<String> {
-    gtk_main_call(|| {
-        let display = gtk::gdk::Display::default()?;
-        let clipboard = gtk::Clipboard::default(&display)?;
-        clipboard.wait_for_text().map(|text| text.to_string())
-    }).flatten()
-}
-
-fn gtk_clipboard_write_text(text: &str, persist: bool) -> bool {
-    let text = text.to_string();
-    gtk_main_call(move || {
-        let Some(display) = gtk::gdk::Display::default() else {
-            log("GTK text clipboard failed: no default GDK display");
-            return false;
-        };
-        let Some(clipboard) = gtk::Clipboard::default(&display) else {
-            log("GTK text clipboard failed: the display has no clipboard selection");
-            return false;
-        };
-        clipboard.set_text(&text);
-        if persist {
-            clipboard.store();
-        }
-        true
-    }).unwrap_or(false)
-}
-
-fn gtk_clipboard_read_image() -> Option<Vec<u8>> {
-    gtk_main_call(|| {
-        let display = gtk::gdk::Display::default()?;
-        let clipboard = gtk::Clipboard::default(&display)?;
-        let pixbuf = clipboard.wait_for_image()?;
-        pixbuf.save_to_bufferv("png", &[]).ok()
-    }).flatten()
-}
-
-fn gtk_clipboard_write_png(bytes: &[u8]) -> bool {
-    let bytes = bytes.to_vec();
-    gtk_main_call(move || {
-        let pixbuf = match gtk::gdk_pixbuf::Pixbuf::from_read(Cursor::new(bytes)) {
-            Ok(pixbuf) => pixbuf,
-            Err(error) => {
-                log(&format!("GTK image clipboard failed to decode the PNG: {error}"));
-                return false;
-            }
-        };
-        let Some(display) = gtk::gdk::Display::default() else {
-            log("GTK image clipboard failed: no default GDK display");
-            return false;
-        };
-        let Some(clipboard) = gtk::Clipboard::default(&display) else {
-            log("GTK image clipboard failed: the display has no clipboard selection");
-            return false;
-        };
-        clipboard.set_image(&pixbuf);
-        clipboard.store();
-        true
-    }).unwrap_or(false)
 }
 
 fn output(program: &str, args: &[&str]) -> Option<String> {
@@ -420,16 +321,7 @@ fn last_clipboard() -> &'static Mutex<String> {
 }
 
 fn clipboard_read() -> Option<String> {
-    // Cinnamon's GTK clipboard bridge talks to the same desktop-owned selection used by
-    // its screenshot tool. Prefer it there, then use the command-line readers as fallback.
-    if desktop_name().contains("cinnamon") {
-        if let Some(text) = gtk_clipboard_read_text().filter(|text| !text.is_empty()) {
-            return Some(text);
-        }
-    }
-    // Do not use the generic output() helper here: it trims whitespace and line endings,
-    // which changes the exact text the user copied. Try the common MIME targets in order
-    // and preserve the clipboard payload byte-for-byte when it is valid UTF-8.
+    // Read from the session clipboard without blocking GTK's UI thread.
     let candidates: &[(&str, &[&str])] = if is_wayland() {
         &[
             ("wl-paste", &["--no-newline", "--type", "text/plain;charset=utf-8"]),
@@ -458,7 +350,7 @@ fn clipboard_read() -> Option<String> {
             return Some(text.trim_end_matches('\0').to_string());
         }
     }
-    gtk_clipboard_read_text()
+    None
 }
 
 // The clipboard helpers normally daemonize after taking ownership. Check their parent
@@ -498,14 +390,13 @@ fn clipboard_helper_write(program: &str, args: &[&str], bytes: &[u8]) -> bool {
         let _ = sender.send(success);
     });
 
-    match receiver.recv_timeout(Duration::from_millis(450)) {
+    match receiver.recv_timeout(Duration::from_millis(600)) {
         Ok(true) => true,
         Ok(false) => {
-            log(&format!("Clipboard helper {program} exited unsuccessfully; trying GTK clipboard"));
+            log(&format!("Clipboard helper {program} exited unsuccessfully"));
             false
         }
-        // A live process is normal for clipboard owners that have to keep serving
-        // the selection. The payload was written and the owner is still running.
+        // xclip/wl-copy can stay alive as the owner of the clipboard selection.
         Err(mpsc::RecvTimeoutError::Timeout) => true,
         Err(error) => {
             log(&format!("Could not collect clipboard helper {program} status: {error}"));
@@ -515,49 +406,27 @@ fn clipboard_helper_write(program: &str, args: &[&str], bytes: &[u8]) -> bool {
 }
 
 fn clipboard_write(text: &str, private: bool) -> bool {
-    // Do not bypass Cinnamon's desktop clipboard owner: GTK writes directly to the
-    // session's CLIPBOARD selection and also stores it for clipboard managers.
-    if desktop_name().contains("cinnamon") {
-        if gtk_clipboard_write_text(text, !private) {
-            *last_clipboard().lock().unwrap() = text.to_string();
-            return true;
-        }
-        log("Cinnamon GTK text clipboard failed; trying the native clipboard helper");
-    }
     let wayland = is_wayland();
-    let program = if wayland {
-        command_exists("wl-copy").then_some("wl-copy")
+    let copied = if wayland {
+        if !command_exists("wl-copy") {
+            log("Text clipboard copy failed: wl-copy is missing; install wl-clipboard");
+            false
+        } else if private {
+            clipboard_helper_write("wl-copy", &["--sensitive"], text.as_bytes())
+        } else {
+            clipboard_helper_write("wl-copy", &[], text.as_bytes())
+        }
     } else if command_exists("xclip") {
-        Some("xclip")
+        clipboard_helper_write("xclip", &["-selection", "clipboard", "-i"], text.as_bytes())
     } else if command_exists("xsel") {
-        Some("xsel")
+        clipboard_helper_write("xsel", &["--clipboard", "--input"], text.as_bytes())
     } else {
-        None
+        log("Text clipboard copy failed: xclip/xsel is missing; install xclip");
+        false
     };
 
-    if let Some(program) = program {
-        let copied = if wayland {
-            if private {
-                clipboard_helper_write(program, &["--sensitive"], text.as_bytes())
-            } else {
-                clipboard_helper_write(program, &[], text.as_bytes())
-            }
-        } else if program == "xclip" {
-            clipboard_helper_write(program, &["-selection", "clipboard", "-i"], text.as_bytes())
-        } else {
-            clipboard_helper_write(program, &["--clipboard", "--input"], text.as_bytes())
-        };
-        if copied {
-            *last_clipboard().lock().unwrap() = text.to_string();
-            return true;
-        }
-    }
-
-    let copied = gtk_clipboard_write_text(text, !private);
     if copied {
         *last_clipboard().lock().unwrap() = text.to_string();
-    } else {
-        log("Clipboard copy failed: both the native helper and GTK clipboard were unavailable");
     }
     copied
 }
@@ -625,13 +494,6 @@ fn build_image_clip(
 }
 
 fn clipboard_read_image() -> Option<Vec<u8>> {
-    // Cinnamon's own screenshot UI publishes PNG through the desktop clipboard.
-    // Read it through GDK first so the image MIME negotiation matches GTK apps.
-    if desktop_name().contains("cinnamon") {
-        if let Some(image) = gtk_clipboard_read_image() {
-            return Some(image);
-        }
-    }
     let candidates: Vec<(&str, Vec<&str>)> = if is_wayland() {
         vec![
             ("wl-paste", vec!["--no-newline", "--type", "image/png"]),
@@ -654,7 +516,7 @@ fn clipboard_read_image() -> Option<Vec<u8>> {
             return Some(result.stdout);
         }
     }
-    gtk_clipboard_read_image()
+    None
 }
 
 fn clipboard_read_file_urls() -> Option<String> {
@@ -663,77 +525,12 @@ fn clipboard_read_file_urls() -> Option<String> {
     } else {
         ("xclip", &["-selection", "clipboard", "-o", "-t", "text/uri-list"])
     };
-    let value = output(program, args).or_else(|| {
-        gtk_main_call(|| {
-            let display = gtk::gdk::Display::default()?;
-            let clipboard = gtk::Clipboard::default(&display)?;
-            let uris = clipboard.wait_for_uris();
-            let text = uris.iter().map(|uri| uri.as_str()).collect::<Vec<_>>().join("\n");
-            (!text.is_empty()).then_some(text)
-        }).flatten()
-    })?;
+    let value = output(program, args)?;
     let urls = value.lines().filter(|line| {
         let line = line.trim();
         !line.is_empty() && !line.starts_with('#')
     }).collect::<Vec<_>>();
     if urls.is_empty() { None } else { Some(urls.join("\n")) }
-}
-
-fn emit_clip_preview(text: &str) {
-    let preview = text.chars().take(400).collect::<String>()
-        .split_whitespace().collect::<Vec<_>>().join(" ");
-    emit("clip", json!({ "kind": "text", "text": text, "preview": preview }));
-}
-
-fn clip_payload() -> Value {
-    Value::Array(clips().lock().unwrap().iter().map(|clip| {
-        if clip.image.is_some() {
-            json!({
-                "id": clip.id, "kind": "image", "preview": clip.preview,
-                "len": 0, "pinned": clip.pinned, "thumb": clip.thumb
-            })
-        } else {
-            let preview = clip.text.chars().take(400).collect::<String>()
-                .split_whitespace().collect::<Vec<_>>().join(" ");
-            json!({
-                "id": clip.id, "kind": "text", "preview": preview,
-                "len": clip.text.chars().count(), "pinned": clip.pinned
-            })
-        }
-    }).collect())
-}
-
-fn save_clips() {
-    let mut pinned: Vec<ClipEntry> = clips().lock().unwrap().iter()
-        .filter(|clip| clip.pinned).cloned().collect();
-    let dir = clip_image_dir();
-    let mut keep = HashSet::new();
-
-    for clip in &mut pinned {
-        if let (Some(name), Some(bytes)) = (clip.image.as_deref(), clip.image_bytes.as_deref()) {
-            if let Some(path) = clip_image_path(name) {
-                if !path.exists() {
-                    let _ = write_atomic(&path, bytes);
-                }
-                keep.insert(name.to_string());
-            }
-        } else if let Some(name) = clip.image.as_deref() {
-            if clip_image_path(name).is_some_and(|path| path.exists()) {
-                keep.insert(name.to_string());
-            }
-        }
-        clip.image_bytes = None;
-    }
-
-    write_json(&data_dir().join("clips.json"), &pinned);
-    if let Ok(entries) = fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if !keep.contains(&name) {
-                let _ = fs::remove_file(entry.path());
-            }
-        }
-    }
 }
 
 fn enforce_clip_limits(list: &mut Vec<ClipEntry>) {
@@ -1473,16 +1270,42 @@ fn screenshot_path() -> PathBuf {
 }
 
 fn run_capture_command(mut command: Command, dest: &Path, tool: &str) -> Result<Vec<u8>, String> {
-    let status = command
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
+        .spawn()
         .map_err(|error| format!("Could not start {tool}: {error}"))?;
+
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < Duration::from_secs(120) => {
+                thread::sleep(Duration::from_millis(80));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                log(&format!("{tool} timed out while waiting for a region selection"));
+                return Err(format!("{tool} timed out. Press Escape to cancel and try again."));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("Could not wait for {tool}: {error}"));
+            }
+        }
+    };
+
     if !status.success() {
-        return Err(format!("{tool} did not complete the capture"));
+        return Err(format!("{tool} did not complete the capture (cancelled or failed)"));
     }
-    fs::read(dest).map_err(|error| format!("{tool} did not create a readable screenshot: {error}"))
+    let bytes = fs::read(dest).map_err(|error| format!("{tool} did not create a readable screenshot: {error}"))?;
+    if bytes.is_empty() || image::load_from_memory(&bytes).is_err() {
+        return Err(format!("{tool} created an invalid screenshot"));
+    }
+    Ok(bytes)
 }
 
 fn capture_selection_slurp(dest: &Path) -> Result<Vec<u8>, String> {
@@ -1512,61 +1335,21 @@ fn desktop_name() -> String {
         .to_ascii_lowercase()
 }
 
-// Prefer the screenshot application shipped by Cinnamon on Cinnamon desktops.
- // Its own Save/Copy dialog owns clipboard publication; Peeky only imports the copied
- // image into its history after the user confirms the copy action.
-fn cinnamon_screenshot_interactive() -> Option<Result<Option<Vec<u8>>, String>> {
-    if !desktop_name().contains("cinnamon") {
-        return None;
-    }
-
-    let program = if command_exists("cinnamon-screenshot") {
-        "cinnamon-screenshot"
-    } else if command_exists("gnome-screenshot") {
-        "gnome-screenshot"
-    } else {
-        log("Cinnamon screenshot UI is unavailable; falling back to the generic capture path");
-        return None;
-    };
-
-    let previous_hash = clipboard_read_image().map(|image| image_hash(&image));
-    log(&format!("Launching Cinnamon-native screenshot UI: {program} --interactive"));
-    let status = match Command::new(program)
-        .arg("--interactive")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-    {
-        Ok(status) => status,
-        Err(error) => return Some(Err(format!("Could not start {program}: {error}"))),
-    };
-
-    if !status.success() {
-        return Some(Err(format!("{program} did not complete successfully")));
-    }
-
-    // The native UI writes the selected image to the desktop clipboard before exiting.
-    // Give the clipboard manager a short moment to expose the image to other apps.
-    for _ in 0..25 {
-        if let Some(image) = clipboard_read_image() {
-            if Some(image_hash(&image)) != previous_hash {
-                log("Cinnamon screenshot UI copied a new image to the desktop clipboard");
-                return Some(Ok(Some(image)));
-            }
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-
-    // No changed image means the user cancelled or chose Save rather than Copy.
-    log("Cinnamon screenshot UI closed without placing a new image on the clipboard");
-    Some(Ok(None))
-}
+// Cinnamon's native screenshot utility is used in area-selection mode. Unlike
+// --interactive, --area opens the region selector directly and writes a PNG that
+// Peeky can publish to the real desktop clipboard itself.
 
 fn capture_selection() -> Result<Vec<u8>, String> {
     let dest = screenshot_path();
     let desktop = desktop_name();
-    let result = if is_wayland() {
+    // Prefer Cinnamon's own GNOME Screenshot tool on Mint/Cinnamon X11. --area
+    // displays the crosshair selector directly; --interactive opens a multi-step
+    // dialog and does not guarantee that the result reaches the clipboard.
+    let result = if !is_wayland() && desktop.contains("cinnamon") && command_exists("gnome-screenshot") {
+        let mut command = Command::new("gnome-screenshot");
+        command.args(["--area", "--file"]).arg(&dest);
+        run_capture_command(command, &dest, "Cinnamon Screenshot")
+    } else if is_wayland() {
         if desktop.contains("kde") && command_exists("spectacle") {
             let mut command = Command::new("spectacle");
             command.args(["--region", "--background", "--nonotify", "--output"]).arg(&dest);
@@ -1605,7 +1388,7 @@ fn capture_selection() -> Result<Vec<u8>, String> {
         command.arg("-s").arg(&dest);
         run_capture_command(command, &dest, "maim")
     } else {
-        Err("No X11 screen selector is installed. Install Flameshot, GNOME Screenshot, Spectacle, or maim".into())
+        Err("No X11 screen selector is installed. Install GNOME Screenshot, Flameshot, Spectacle, or maim".into())
     };
     let _ = fs::remove_file(&dest);
     result
@@ -1646,56 +1429,100 @@ fn capture_fullscreen() -> Result<Vec<u8>, String> {
 }
 
 fn clipboard_write_png(bytes: &[u8]) -> bool {
-    // Cinnamon/GTK applications share the same desktop clipboard selection. Use
-    // GDK first here rather than an external xclip owner, especially for image/png.
-    if desktop_name().contains("cinnamon") {
-        if gtk_clipboard_write_png(bytes) {
-            *last_clipboard().lock().unwrap() = format!("image:{:016x}", image_hash(bytes));
-            return true;
-        }
-        log("Cinnamon GTK image clipboard failed; trying the native clipboard helper");
-    }
-    let helper = if is_wayland() {
-        command_exists("wl-copy").then_some(("wl-copy", vec!["--type", "image/png"]))
+    let (program, args): (&str, &[&str]) = if is_wayland() {
+        ("wl-copy", &["--type", "image/png"])
     } else {
-        command_exists("xclip").then_some(("xclip", vec!["-selection", "clipboard", "-t", "image/png", "-i"]))
+        ("xclip", &["-selection", "clipboard", "-t", "image/png", "-i"])
     };
 
-    if let Some((program, args)) = helper {
-        if clipboard_helper_write(program, &args, bytes) {
-            *last_clipboard().lock().unwrap() = format!("image:{:016x}", image_hash(bytes));
-            return true;
-        }
+    if !command_exists(program) {
+        log(&format!("Image clipboard copy failed: {program} is missing"));
+        return false;
+    }
+    if clipboard_helper_write(program, args, bytes) {
+        *last_clipboard().lock().unwrap() = format!("image:{:016x}", image_hash(bytes));
+        return true;
     }
 
-    if gtk_clipboard_write_png(bytes) {
-        *last_clipboard().lock().unwrap() = format!("image:{:016x}", image_hash(bytes));
-        true
-    } else {
-        log("Image clipboard copy failed: both the native helper and GTK clipboard were unavailable");
-        false
+    log(&format!("Image clipboard copy failed: {program} could not own the clipboard selection"));
+    false
+}
+
+struct CaptureBusyGuard;
+impl Drop for CaptureBusyGuard {
+    fn drop(&mut self) {
+        CAPTURE_ACTIVE.store(false, Ordering::SeqCst);
     }
 }
 
-fn ocr_start() {
-    match capture_selection() {
-        Ok(png) => {
-            let encoded = {
-                const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-                let mut out = String::with_capacity((png.len() + 2) / 3 * 4);
-                for chunk in png.chunks(3) {
-                    let a = chunk[0]; let b = *chunk.get(1).unwrap_or(&0); let c = *chunk.get(2).unwrap_or(&0);
-                    out.push(TABLE[(a >> 2) as usize] as char);
-                    out.push(TABLE[(((a & 3) << 4) | (b >> 4)) as usize] as char);
-                    out.push(if chunk.len() > 1 { TABLE[(((b & 15) << 2) | (c >> 6)) as usize] as char } else { '=' });
-                    out.push(if chunk.len() > 2 { TABLE[(c & 63) as usize] as char } else { '=' });
-                }
-                out
-            };
-            emit("ocr-read", json!({ "png": encoded }));
-        }
-        Err(why) => emit("ocr", json!({ "ok": false, "why": why })),
+fn capture_is_busy() -> bool {
+    CAPTURE_ACTIVE.swap(true, Ordering::SeqCst)
+}
+
+fn screenshot_start() {
+    if capture_is_busy() {
+        emit("helper", json!({ "t": "capture-error", "message": "A screenshot or text scan is already in progress." }));
+        return;
     }
+
+    thread::spawn(|| {
+        let _guard = CaptureBusyGuard;
+        log("Starting region screenshot selection");
+        match capture_selection() {
+            Ok(png) => {
+                log(&format!("Region screenshot captured ({} bytes); copying PNG to clipboard", png.len()));
+                if clipboard_write_png(&png) {
+                    if setting_flag("clipHistory") { add_clip_image(png); }
+                    log("Region screenshot copied to system clipboard and added to Peeky history");
+                    emit("clip", json!({ "kind": "image" }));
+                } else {
+                    emit("helper", json!({
+                        "t": "capture-error",
+                        "message": if is_wayland() {
+                            "Could not copy the screenshot: install wl-clipboard (wl-copy)."
+                        } else {
+                            "Could not copy the screenshot: install xclip (sudo apt install xclip)."
+                        }
+                    }));
+                }
+            }
+            Err(why) => {
+                log(&format!("Screenshot failed: {why}"));
+                if !why.to_ascii_lowercase().contains("cancel") {
+                    emit("helper", json!({ "t": "capture-error", "message": why }));
+                }
+            }
+        }
+    });
+}
+
+fn ocr_start() {
+    if capture_is_busy() {
+        emit("ocr", json!({ "ok": false, "why": "A screenshot or text scan is already in progress" }));
+        return;
+    }
+
+    thread::spawn(|| {
+        let _guard = CaptureBusyGuard;
+        match capture_selection() {
+            Ok(png) => {
+                let encoded = {
+                    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                    let mut out = String::with_capacity((png.len() + 2) / 3 * 4);
+                    for chunk in png.chunks(3) {
+                        let a = chunk[0]; let b = *chunk.get(1).unwrap_or(&0); let c = *chunk.get(2).unwrap_or(&0);
+                        out.push(TABLE[(a >> 2) as usize] as char);
+                        out.push(TABLE[(((a & 3) << 4) | (b >> 4)) as usize] as char);
+                        out.push(if chunk.len() > 1 { TABLE[(((b & 15) << 2) | (c >> 6)) as usize] as char } else { '=' });
+                        out.push(if chunk.len() > 2 { TABLE[(c & 63) as usize] as char } else { '=' });
+                    }
+                    out
+                };
+                emit("ocr-read", json!({ "png": encoded }));
+            }
+            Err(why) => emit("ocr", json!({ "ok": false, "why": why })),
+        }
+    });
 }
 
 fn ocr_done_impl(text: &str, _conf: f64) {
@@ -2891,38 +2718,7 @@ fn settings_set(key: String, value: Value) { settings_apply(&key, &value); }
 #[tauri::command]
 fn action(name: String) {
     match name.as_str() {
-        "screenshot" => {
-            if let Some(native_result) = cinnamon_screenshot_interactive() {
-                match native_result {
-                    Ok(Some(png)) => {
-                        *last_clipboard().lock().unwrap() = format!("image:{:016x}", image_hash(&png));
-                        if setting_flag("clipHistory") { add_clip_image(png); }
-                        emit("clip", json!({ "kind": "image" }));
-                    }
-                    // The Cinnamon dialog already handles Save and Cancel. Do not launch
-                    // another selector or overwrite the user's clipboard in those cases.
-                    Ok(None) => {}
-                    Err(why) => {
-                        log(&format!("Cinnamon screenshot UI failed: {why}"));
-                        emit("helper", json!({ "t": "capture-error", "message": why }));
-                    }
-                }
-            } else {
-                match capture_selection() {
-                    Ok(png) if clipboard_write_png(&png) => {
-                        // The writer updates LAST_CLIPBOARD to avoid a duplicate watcher event,
-                        // so add the screenshot to history right here instead of waiting for polling.
-                        if setting_flag("clipHistory") { add_clip_image(png); }
-                        emit("clip", json!({ "kind": "image" }));
-                    }
-                    Ok(_) => emit("helper", json!({ "t": "capture-error", "message": "Could not copy the selected screenshot. GTK clipboard and the desktop clipboard helper both failed." })),
-                    Err(why) => {
-                        log(&format!("Screenshot failed: {why}"));
-                        emit("helper", json!({ "t": "capture-error", "message": why }));
-                    }
-                }
-            }
-        }
+        "screenshot" => screenshot_start(),
         "dnd" => {
             if command_exists("gnome-control-center") { let _ = Command::new("gnome-control-center").arg("notifications").spawn(); }
             else if command_exists("systemsettings") { let _ = Command::new("systemsettings").arg("kcm_notifications").spawn(); }
@@ -3527,7 +3323,12 @@ fn register_x11_hotkeys(app: &tauri::App) {
 }
 
 fn main() {
+    std::panic::set_hook(Box::new(|info| {
+        log(&format!("PANIC: {info}"));
+        log(&format!("Backtrace:\n{}", std::backtrace::Backtrace::force_capture()));
+    }));
     initialize_x11_threading();
+    log(&format!("Starting Peeky {} on {} ({})", env!("CARGO_PKG_VERSION"), if is_wayland() { "Wayland" } else { "X11" }, desktop_name()));
     settings_load();
     notes_load();
     vault_load();
@@ -3558,7 +3359,6 @@ fn main() {
             vault_list, vault_generate, vault_save, vault_edit, fg_context, vault_copy, copy_secret, vault_reveal, vault_remove, debug_out
         ])
         .setup(|app| {
-            let _ = GTK_MAIN_THREAD_ID.set(thread::current().id());
             let _ = APP.set(app.handle().clone());
             if !is_wayland() { register_x11_hotkeys(app); }
 
