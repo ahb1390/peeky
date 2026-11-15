@@ -72,9 +72,7 @@ pub fn set_typing(on: bool, restore: bool) -> serde_json::Value {
             let fg = GetForegroundWindow();
             if sys::root_of(fg) != h {
                 PREV_FG.store(fg.0 as isize, SeqCst);
-                // what the user was looking at: used to suggest a name when a password is saved
-                let exe = sys::exe_of_pid(sys::pid_of(fg)).unwrap_or_default();
-                ctx = json!({ "title": sys::title_of(fg), "exe": exe.rsplit('\\').next().unwrap_or("") });
+                ctx = context_of(fg);
             }
             TYPING.store(true, SeqCst);
             INTERACTIVE.store(true, SeqCst);
@@ -90,6 +88,22 @@ pub fn set_typing(on: bool, restore: bool) -> serde_json::Value {
         }
     }
     ctx
+}
+
+/// What the user is looking at (window title and program): used to suggest a name when a password is saved.
+unsafe fn context_of(w: HWND) -> serde_json::Value {
+    let exe = sys::exe_of_pid(sys::pid_of(w)).unwrap_or_default();
+    json!({ "title": sys::title_of(w), "exe": exe.rsplit('\\').next().unwrap_or("") })
+}
+/// The same, for the window in front right now, without taking the focus from it ({} when the island itself is in front).
+pub fn fg_context() -> serde_json::Value {
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.0.is_null() || sys::root_of(fg) == sys::hwnd() {
+            return json!({});
+        }
+        context_of(fg)
+    }
 }
 
 pub fn start() {

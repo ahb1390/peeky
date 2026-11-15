@@ -138,19 +138,67 @@ fn unprotect(data: &[u8]) -> Option<Vec<u8>> {
         Some(take(out))
     }
 }
+/// Reads the vault file. Only a file that is really not there counts as an empty vault: any other failure
+/// (the file busy for a moment, a disk hiccup) is tried again, and if it keeps failing the vault is treated
+/// as unreadable, so nothing is ever written over it.
+fn load_vault() -> Vault {
+    let mut tries = 0;
+    let raw = loop {
+        match std::fs::read(vault_file()) {
+            Ok(raw) => break raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vault { entries: Vec::new(), unreadable: false },
+            Err(e) if tries < 6 => {
+                tries += 1;
+                if tries == 1 {
+                    sys::log(&format!("the vault file could not be read ({e}); trying again"));
+                }
+                std::thread::sleep(Duration::from_millis(150));
+            }
+            Err(e) => {
+                sys::log(&format!("the vault file could not be read ({e}); it is left untouched"));
+                return Vault { entries: Vec::new(), unreadable: true };
+            }
+        }
+    };
+    match unprotect(&raw).and_then(|plain| serde_json::from_slice::<Vec<Entry>>(&plain).ok()) {
+        Some(entries) => Vault { entries, unreadable: false },
+        None => {
+            sys::log("the vault file could not be opened with this Windows account; it is left untouched");
+            Vault { entries: Vec::new(), unreadable: true }
+        }
+    }
+}
 fn with_vault<T>(f: impl FnOnce(&mut Vault) -> T) -> T {
     let mut g = VAULT.lock().unwrap();
-    let v = g.get_or_insert_with(|| match std::fs::read(vault_file()) {
-        Err(_) => Vault { entries: Vec::new(), unreadable: false },
-        Ok(raw) => match unprotect(&raw).and_then(|plain| serde_json::from_slice::<Vec<Entry>>(&plain).ok()) {
-            Some(entries) => Vault { entries, unreadable: false },
-            None => {
-                sys::log("the vault file could not be opened with this Windows account; it is left untouched");
-                Vault { entries: Vec::new(), unreadable: true }
-            }
-        },
-    });
+    let v = g.get_or_insert_with(load_vault);
     f(v)
+}
+const BACKUPS_KEPT: usize = 50;
+/// Before every change the current file is copied to vault-backups\vault-<time>.bin (still encrypted);
+/// the newest 50 copies are kept.
+fn backup_vault() {
+    let src = vault_file();
+    if !src.exists() {
+        return;
+    }
+    let dir = sys::data_dir().join("vault-backups");
+    if std::fs::create_dir_all(&dir).is_err() || std::fs::copy(&src, dir.join(format!("vault-{}.bin", sys::now_ms()))).is_err() {
+        sys::log("could not keep a backup of the vault before changing it");
+        return;
+    }
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        let mut files: Vec<PathBuf> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("vault-") && n.ends_with(".bin")))
+            .collect();
+        files.sort(); // the names carry the time, so this is oldest first
+        if files.len() > BACKUPS_KEPT {
+            for p in &files[..files.len() - BACKUPS_KEPT] {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
 }
 fn vault_changed(v: &mut Vault) -> bool {
     if v.unreadable {
@@ -161,6 +209,7 @@ fn vault_changed(v: &mut Vault) -> bool {
         }
         v.unreadable = false;
     }
+    backup_vault();
     let plain = serde_json::to_vec(&v.entries).unwrap_or_default();
     let ok = protect(&plain).is_some_and(|enc| write_atomic(&vault_file(), &enc));
     sys::emit("vault", vault_public(v));
@@ -178,15 +227,29 @@ fn vault_public(v: &Vault) -> Value {
 pub fn vault_list() -> Value {
     with_vault(|v| vault_public(v))
 }
-pub fn vault_save(site: &str, user: &str, pass: &str) -> bool {
+/// Adds an entry (never replaces one, even with the same site and user). Returns its id, or 0 if it could not be written.
+pub fn vault_save(site: &str, user: &str, pass: &str) -> u64 {
     let (site, user) = (site.trim(), user.trim());
     if pass.is_empty() || pass.len() > 1000 || site.len() > 300 || user.len() > 300 {
-        return false;
+        return 0;
     }
     with_vault(|v| {
         let id = v.entries.iter().map(|e| e.id).max().unwrap_or(0) + 1;
         let site = if site.is_empty() { "Untitled" } else { site };
         v.entries.push(Entry { id, site: site.to_string(), user: user.to_string(), pass: pass.to_string(), at: sys::now_ms() });
+        if vault_changed(v) { id } else { 0 }
+    })
+}
+/// Renames an entry and sets its username; the password stays as it is.
+pub fn vault_edit(id: u64, site: &str, user: &str) -> bool {
+    let (site, user) = (site.trim(), user.trim());
+    if site.len() > 300 || user.len() > 300 {
+        return false;
+    }
+    with_vault(|v| {
+        let Some(e) = v.entries.iter_mut().find(|e| e.id == id) else { return false };
+        e.site = if site.is_empty() { "Untitled".to_string() } else { site.to_string() };
+        e.user = user.to_string();
         vault_changed(v)
     })
 }

@@ -236,7 +236,7 @@ button { font: inherit; color: inherit; background: none; border: 0; cursor: poi
 .row .act:hover { background: rgba(255, 255, 255, .16); color: #fff; }
 .row.vault .ic { background: linear-gradient(135deg, var(--c1), var(--c3)); }
 .row.vault .x.sure { display: grid; background: #ff3b5c; color: #fff; }
-.row .who { flex: none; max-width: 150px; overflow: hidden; text-overflow: ellipsis; font-size: 11px; }
+.row .who { flex: none; max-width: 120px; overflow: hidden; text-overflow: ellipsis; font-size: 11px; }
 .row.actions { background: none; box-shadow: none; justify-content: center; gap: 8px; cursor: default; }
 .row.actions:hover { transform: none; background: none; }
 .row.actions button { height: 28px; padding: 0 13px; border-radius: 14px; background: #000; box-shadow: 0 3px 12px rgba(0, 0, 0, .35), inset 0 0 0 1px rgba(255, 255, 255, .1); font-size: 12px; color: rgba(255, 255, 255, .88); display: inline-flex; align-items: center; gap: 5px; transition: background .15s, color .15s, transform .2s var(--spring); }
@@ -370,3 +370,21 @@ body.daylight #island .sep { background: rgba(24, 34, 47, .25); }
 .row.tour .ic.plain { width: 30px; height: 30px; border-radius: 50%; background-color: rgba(255, 255, 255, .09); color: #fff; }
 .row.tour .lbl .dim { overflow: hidden; text-overflow: ellipsis; }
 .row .keys { flex: none; height: 20px; padding: 0 8px; border-radius: 10px; background: rgba(255, 255, 255, .1); color: rgba(255, 255, 255, .75); font-size: 10.5px; display: inline-flex; align-items: center; margin-right: 4px; }
+
+/* ------------------------------------------------ passwords: search and buttons above the list, which stays open */
+#stack-head { display: none; width: 100%; padding: 6px 20px 2px; gap: 6px; align-items: center; }
+#stack-head.on { display: flex; }
+#stack-head .search { flex: 1; min-width: 0; height: 30px; border-radius: 15px; background: #000; box-shadow: 0 3px 12px rgba(0, 0, 0, .35), inset 0 0 0 1px rgba(255, 255, 255, .1); display: flex; align-items: center; gap: 7px; padding: 0 12px 0 11px; color: rgba(255, 255, 255, .45); cursor: text; transition: box-shadow .15s, color .15s; }
+#stack-head .search svg { flex: none; width: 14px; height: 14px; }
+#stack-head .search:focus-within { box-shadow: 0 3px 12px rgba(0, 0, 0, .35), inset 0 0 0 1.5px rgba(169, 139, 255, .75); color: #fff; }
+#stack-head input { flex: 1; min-width: 0; height: 100%; background: none; border: 0; outline: 0; color: #fff; font: inherit; font-size: 12.5px; caret-color: #a98bff; }
+#stack-head input::placeholder { color: rgba(255, 255, 255, .38); }
+#stack-head .pillbtn { flex: none; height: 30px; padding: 0 12px; border-radius: 15px; background: #000; box-shadow: 0 3px 12px rgba(0, 0, 0, .35), inset 0 0 0 1px rgba(255, 255, 255, .1); font-size: 12px; color: rgba(255, 255, 255, .88); display: inline-flex; align-items: center; gap: 5px; transition: background .15s, color .15s, transform .2s var(--spring); }
+#stack-head .pillbtn svg { width: 13px; height: 13px; }
+#stack-head .pillbtn:hover { background: #fff; color: #000; transform: scale(1.05); }
+#stack-head .pillbtn.round { width: 30px; padding: 0; justify-content: center; }
+.row.vault.sel { background: #161616; box-shadow: 0 3px 12px rgba(0, 0, 0, .35), inset 0 0 0 1.5px rgba(169, 139, 255, .6); }
+.row .act.ok { color: #34d399; background: rgba(52, 211, 153, .14); }
+/* a password step waiting on the pill while another window is used: its icon breathes */
+.parked #in-icon { animation: waiting 1.6s ease-in-out infinite; }
+@keyframes waiting { 50% { opacity: .3; } }

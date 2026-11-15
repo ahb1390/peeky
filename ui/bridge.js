@@ -75,7 +75,9 @@ window.qazi = {
 
   vaultList: () => invoke('vault_list'),
   vaultGenerate: (len, symbols) => invoke('vault_generate', { len, symbols: !!symbols }),
-  vaultSave: (site, user, pass) => invoke('vault_save', { site, user, pass }),
+  vaultSave: (site, user, pass) => invoke('vault_save', { site, user, pass }).catch(() => 0),     // the new entry's id, 0 = not saved
+  vaultEdit: (id, site, user) => invoke('vault_edit', { id, site, user }).catch(() => false),
+  fgContext: () => invoke('fg_context').catch(() => ({})),
   vaultCopy: (id, what) => invoke('vault_copy', { id, what }),
   copySecret: (text) => invoke('copy_secret', { text }),
   vaultReveal: (id) => invoke('vault_reveal', { id }),

@@ -247,7 +247,10 @@ fn read_persian(px: &[u8], w: i32, h: i32) -> Option<String> {
     Some(text.chars().map(|c| match c { 'ي' | 'ى' => 'ی', 'ك' => 'ک', ',' => '،', _ => c }).collect::<String>().trim().to_string())
 }
 /// Which of the two readings is the real one. The Persian reader always answers something, even for English
-/// text (a soup of digits and stray letters), so its answer counts only when it is sure and nearly all letters.
+/// text (a soup of digits and stray letters), and the longer the box the more of that soup there is. So its
+/// answer counts only when it is sure, mostly letters, and reads at least half as many letters as Windows'
+/// reader found Latin ones (Windows reads English well; on Persian it finds only a few stray letters).
+/// None = Windows' reader is not there at all; Some("") = nothing readable in the box.
 fn choose(first: Option<String>, persian: Option<String>) -> Option<String> {
     let conf = CONF.load(SeqCst);
     let p = persian.as_deref().unwrap_or("");
@@ -255,11 +258,20 @@ fn choose(first: Option<String>, persian: Option<String>) -> Option<String> {
     let inked = p.chars().filter(|c| !c.is_whitespace()).count().max(1);
     let latin = first.as_deref().unwrap_or("").chars().filter(|c| c.is_ascii_alphabetic()).count();
     let pure = letters * 100 / inked;
-    sys::log(&format!("text grab: windows reader {} latin letters; persian reader {letters} letters, {pure}% of its output, confidence {conf}", latin));
-    if conf >= 45 && (letters >= 8 || (letters >= 3 && pure >= 70)) {
+    let take = conf >= 45 && letters >= 3 && letters * 2 >= latin && (pure >= 70 || (letters >= 8 && pure >= 40));
+    sys::log(&format!(
+        "text grab: windows reader {latin} latin letters; persian reader {letters} letters, {pure}% of its output, confidence {conf} -> {}",
+        if take { "persian" } else { "windows" }
+    ));
+    if take {
         return persian;
     }
-    first.filter(|t| !t.trim().is_empty())
+    match first {
+        Some(t) => Some(t),
+        // no Windows reader: the Persian reading is all there is, if it is any good
+        None if conf >= 45 && letters >= 3 && pure >= 40 => persian,
+        None => None,
+    }
 }
 pub fn start() {
     if BUSY.swap(true, SeqCst) {

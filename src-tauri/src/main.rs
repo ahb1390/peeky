@@ -254,13 +254,31 @@ fn vault_generate(len: usize, symbols: bool) -> String {
     store::generate(len, symbols)
 }
 #[tauri::command]
-fn vault_save(site: String, user: String, pass: String) -> bool {
-    let ok = store::vault_save(&site, &user, &pass);
-    if ok && !user.trim().is_empty() {
+/// Returns the new entry's id (0 = it could not be written).
+fn vault_save(site: String, user: String, pass: String) -> u64 {
+    let id = store::vault_save(&site, &user, &pass);
+    if id != 0 {
+        remember_user(&user);
+    }
+    id
+}
+#[tauri::command]
+fn vault_edit(id: u64, site: String, user: String) -> bool {
+    let ok = store::vault_edit(id, &site, &user);
+    if ok {
+        remember_user(&user);
+    }
+    ok
+}
+fn remember_user(user: &str) {
+    if !user.trim().is_empty() {
         settings::put("lastUser", user.trim().into());
         settings::broadcast();
     }
-    ok
+}
+#[tauri::command]
+fn fg_context() -> Value {
+    hit::fg_context()
 }
 #[tauri::command]
 fn vault_copy(id: u64, what: String) -> bool {
@@ -369,7 +387,7 @@ fn main() {
             shelf_get, shelf_add, shelf_add_data, shelf_add_url, shelf_remove, shelf_clear, shelf_reveal, shelf_drag, open_download,
             settings_get, settings_set, action, open_url, ocr_done, speedo_cmd, update_check, update_install,
             notes_get, note_save, note_pin, note_fired, note_remove,
-            vault_list, vault_generate, vault_save, vault_copy, copy_secret, vault_reveal, vault_remove, debug_out
+            vault_list, vault_generate, vault_save, vault_edit, fg_context, vault_copy, copy_secret, vault_reveal, vault_remove, debug_out
         ])
         .setup(move |app| {
             let _ = sys::APP.set(app.handle().clone());

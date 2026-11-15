@@ -3,7 +3,7 @@
 'use strict';
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => [...document.querySelectorAll(s)];
-const island = $('#island'), glow = $('#glow'), stackEl = $('#stack'), stackList = $('#stack-list');
+const island = $('#island'), glow = $('#glow'), stackEl = $('#stack'), stackList = $('#stack-list'), stackHead = $('#stack-head');
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
 // ------------------------------------------------------------ icons
@@ -51,6 +51,8 @@ const ICONS = {
   calc: `<rect ${S} x="5" y="3.5" width="14" height="17" rx="2.5"/><path ${S} d="M8.5 7.5h7M8.5 12h.01M12 12h.01M15.5 12h.01M8.5 16h.01M12 16h.01M15.5 16h.01"/>`,
   cal: `<rect ${S} x="4" y="5.5" width="16" height="14.5" rx="2.5"/><path ${S} d="M4 10h16M8.5 3.5V7M15.5 3.5V7"/>`,
   drop: '<path fill="currentColor" d="M12 3.5c3.2 3.9 5.5 6.7 5.5 9.800a5.500 5.500 0 0 1-11 0c0-3.100 2.300-5.900 5.500-9.800z"/>',
+  search: `<circle ${S} cx="10.5" cy="10.5" r="6"/><path ${S} d="M15 15l5 5"/>`,
+  edit: `<path ${S} d="M4.5 19.5h4l10-10-4-4-10 10zM13 7l4 4"/>`,
   gear: `<circle ${S} cx="12" cy="12" r="2.8"/><path ${S} d="M12 3.5v2.2M12 18.3v2.2M3.5 12h2.2M18.3 12h2.2M6 6l1.6 1.6M16.4 16.4L18 18M18 6l-1.6 1.6M7.6 16.4L6 18"/>`,
 };
 const svg = (name) => `<svg viewBox="0 0 24 24">${ICONS[name] || ''}</svg>`;
@@ -82,8 +84,11 @@ const st = {
   // auto-hide: tuck above the screen edge while an app window sits underneath (always for fullscreen apps)
   covered: false, full: false, tucked: false, peekSince: 0, revealUntil: 0,
   typing: false, holdUntil: 0,                     // a text field is open on the pill / something opened from outside stays put
+  parked: false,                                   // a password step waits on the pill while the user works in another window
+  keys: false,                                     // a search box under the pill holds the keyboard
   face: 'eyes', settings: {}, notes: [], vault: { items: [] }, ctx: {}, lastUser: '',
-  gen: { pass: '', len: 18, symbols: true, until: 0 },
+  vaultQ: '', vaultSel: 0,                         // the search over saved passwords, and the row Enter would copy
+  gen: { pass: '', len: 18, symbols: true },
   skin: 'black', musicTheme: 'sky',                // what the pill wears at rest / while music plays
   net: { online: true, vpn: '', proxy: false }, sensors: { mic: [], cam: [] },
   smartCopy: true, hudAct: null, muteClipUntil: 0, react: true,
@@ -91,7 +96,7 @@ const st = {
 // the window takes the mouse only while the cursor is on the island (or a text field is open)
 let mouseSent = null;
 function syncMouse(force) {
-  const want = st.hover || st.typing || st.dragOut;
+  const want = st.hover || (st.typing && !st.parked) || st.dragOut;
   if (force || want !== mouseSent) { mouseSent = want; window.qazi.setInteractive(want); }
 }
 setInterval(() => syncMouse(true), 500);      // repeated, so one lost message can never leave the pill unclickable
@@ -124,7 +129,7 @@ function updateTuck() {
   const want = !st.force && (st.full || (st.autoHide && st.covered));
   // dwelling on the very top edge of the screen peeks the island back out
   if (want && st.tucked && st.peekSince && now - st.peekSince > 220) { st.revealUntil = now + 1400; st.peekSince = 0; }
-  const reveal = st.notif || now < st.volUntil || now < st.hudUntil || dragging() || st.dragOut || st.scrubbing || st.hover || st.typing || timer.running || (st.shelfOn && st.shelf.length && !st.full) || st.stackOpen || now < st.revealUntil || now < st.holdUntil || (!st.tucked && now - st.leftAt < 900);   // a running timer stays on screen, fullscreen or not
+  const reveal = st.notif || now < st.volUntil || now < st.hudUntil || dragging() || st.dragOut || st.scrubbing || st.hover || st.typing || timer.running || (st.shelfOn && st.shelf.length && !st.full) || st.stackOpen || st.manual === 'gen' || now < st.revealUntil || now < st.holdUntil || (!st.tucked && now - st.leftAt < 900);   // a running timer stays on screen, fullscreen or not
   const tucked = !!(want && !reveal);
   island.classList.toggle('full', st.full);
   if (tucked !== st.tucked) {
@@ -138,8 +143,9 @@ function updateTuck() {
 function render() {
   // nothing closes while a file is on its way out, while typing, or right after it was opened from the tray / a shortcut
   const now = Date.now(), away = !st.hover && !st.dragOut && !st.typing && now > st.holdUntil;
-  if (st.stackOpen && away && now - st.leftAt > 650) setStack(false);
-  if (away && !st.stackOpen && now - st.leftAt > 380 && !(st.manual === 'gen' && now < st.gen.until)) st.manual = null;
+  // the password list and a fresh password stay until the user closes them: they are used together with another window
+  if (st.stackOpen && st.stackKind !== 'vault' && away && now - st.leftAt > 650) setStack(false);
+  if (away && !st.stackOpen && now - st.leftAt > 380 && st.manual !== 'gen') st.manual = null;
   const viz = st.media.playing && musicOn() && st.visuals;
   if (viz !== st.vizOn) { st.vizOn = viz; window.qazi.setViz(viz); }
   updateTuck();
@@ -433,6 +439,7 @@ window.qazi.clipsGet().then(setClips);
 
 function renderStack() {
   stackList.textContent = '';
+  if (st.stackKind !== 'vault' && stackHead.dataset.kind) { stackHead.textContent = ''; stackHead.dataset.kind = ''; stackHead.classList.remove('on'); }
   if (st.stackKind === 'files') { renderFiles(); return; }
   if (st.stackKind === 'clips') { renderClips(); return; }
   if (st.stackKind === 'notes') { renderNotes(); return; }
@@ -469,6 +476,8 @@ let freshT = 0;
 function setStack(open, kind) {
   kind = kind || st.stackKind;
   if (st.stackOpen === open && (!open || kind === st.stackKind)) return;
+  if (st.stackOpen && st.stackKind === 'vault') releaseKeys(true);      // leaving the passwords: the keyboard goes back
+  if (open && kind === 'vault') { st.vaultQ = ''; st.vaultSel = 0; stackHead.dataset.kind = ''; }
   st.stackOpen = open;
   if (open) st.stackKind = kind;
   stackEl.classList.toggle('open', open);
@@ -603,7 +612,7 @@ $('#hd-menu').addEventListener('click', () => { setStack(false); st.manual = 'to
 $('#t-shelf').addEventListener('dragstart', (e) => { e.preventDefault(); window.qazi.shelfDrag(st.shelf.map((f) => f.path)); });
 
 // ------------------------------------------------------------ media
-const DEFAULT_PAL = ['#3319a8', '#4c2bc4', '#6a42dc'];     // violet night sky (deep enough that white text stays easy to read)
+const DEFAULT_PAL = ['#1f0e6b', '#33199a', '#4c2cbf'];     // dark violet night sky (deep enough that white text stays easy to read)
 // Skins: animated surfaces the pill can wear. At rest they move slowly; with music they react to the sound.
 const THEMES = {
   nebula: { name: 'Nebula', pal: ['#7a1fd1', '#c0269a', '#ff4f9a'] },
@@ -616,51 +625,20 @@ const THEMES = {
   lava: { name: 'Lava', pal: ['#e02a0c', '#ff7a18', '#ffd24a'] },
   ice: { name: 'Ice', pal: ['#5aa9e6', '#9fd3f7', '#e9f6ff'] },
 };
-let palette = DEFAULT_PAL.slice(), lookNow = null, lookDrawn = 'sky';
+const palette = DEFAULT_PAL;
+let lookNow = null, lookDrawn = 'sky';
 function applyPal() {       // the accent colours (glow, switches) follow whatever the pill is wearing
   const p = THEMES[lookNow] ? THEMES[lookNow].pal : palette;
   const r = document.documentElement.style;
   r.setProperty('--c1', p[0]); r.setProperty('--c2', p[1]); r.setProperty('--c3', p[2]);
 }
-function setPalette(p) { palette = p; applyPal(); }
-function rgb2hsl(r, g, b) {
-  r /= 255; g /= 255; b /= 255;
-  const mx = Math.max(r, g, b), mn = Math.min(r, g, b), l = (mx + mn) / 2;
-  let h = 0, s = 0;
-  if (mx !== mn) {
-    const d = mx - mn;
-    s = l > 0.5 ? d / (2 - mx - mn) : d / (mx + mn);
-    h = mx === r ? (g - b) / d + (g < b ? 6 : 0) : mx === g ? (b - r) / d + 2 : (r - g) / d + 4;
-    h *= 60;
-  }
-  return [h, s * 100, l * 100];
-}
-// the sky takes the cover's dominant hue: deep on the left, lighter towards the right (like the default violet)
-function paletteFromImage(img) {
-  const c = document.createElement('canvas'); c.width = c.height = 24;
-  const g = c.getContext('2d'); g.drawImage(img, 0, 0, 24, 24);
-  const d = g.getImageData(0, 0, 24, 24).data;
-  const bins = new Array(12).fill(0).map(() => ({ w: 0, h: 0, s: 0 }));
-  for (let i = 0; i < d.length; i += 4) {
-    const [h, s, l] = rgb2hsl(d[i], d[i + 1], d[i + 2]);
-    if (s < 18 || l < 12 || l > 92) continue;
-    const b = bins[Math.floor(h / 30) % 12], w = s * (1 - Math.abs(l - 55) / 55);
-    b.w += w; b.h += h * w; b.s += s * w;
-  }
-  const top = bins.filter((b) => b.w > 0).sort((a, b) => b.w - a.w)[0];
-  if (!top) return DEFAULT_PAL.slice();
-  const h = Math.round(top.h / top.w), s = Math.round(clamp(top.s / top.w + 15, 55, 95));
-  return [`hsl(${h} ${s}% 30%)`, `hsl(${(h + 14) % 360} ${s}% 37%)`, `hsl(${(h + 30) % 360} ${s}% 44%)`];
-}
+// The sky is always this violet, whatever the cover looks like (a cover's colours once turned it brown or gold).
 function setArt(b64) {
   const art = $('#art');
-  if (!b64) { art.style.backgroundImage = ''; art.innerHTML = svg('note'); setPalette(DEFAULT_PAL.slice()); return; }
+  if (!b64) { art.style.backgroundImage = ''; art.innerHTML = svg('note'); return; }
   const url = `data:image/png;base64,${b64}`;
   const img = new Image();
-  img.onload = () => {
-    art.style.backgroundImage = `url(${url})`; art.innerHTML = '';
-    try { setPalette(paletteFromImage(img)); } catch { setPalette(DEFAULT_PAL.slice()); }
-  };
+  img.onload = () => { art.style.backgroundImage = `url(${url})`; art.innerHTML = ''; };
   img.onerror = () => setArt(null);
   img.src = url;
 }
@@ -1385,11 +1363,19 @@ $('#tm-reset').addEventListener('click', () => { timer.running = false; timer.do
 // ------------------------------------------------------------ one line of typing on the pill
 // ask() turns the pill into a text field and resolves with what was typed (null = cancelled).
 // With keep:true the field stays open after Enter, for a follow-up question.
-let askDone = null, askKeep = false, askAt = 0;
+// With stay:true (the password steps) clicking another window does not cancel: the field waits on the pill,
+// the keyboard goes back to that window, and a click on the field picks it up again.
+let askDone = null, askKeep = false, askAt = 0, askStay = false;
 const inText = $('#in-text');
+function setParked(on) {
+  st.parked = on;
+  island.classList.toggle('parked', on);
+  syncMouse(); render();
+}
 function closeTyping(restore) {
   if (!st.typing) return;
   st.typing = false; inText.blur();
+  if (st.parked) setParked(false);
   window.qazi.setTyping(false, restore);
   st.leftAt = Date.now(); syncMouse(); render();
 }
@@ -1400,10 +1386,11 @@ function ask(o) {
     inText.type = o.secret ? 'password' : 'text';
     inText.placeholder = o.placeholder || ''; inText.value = o.value || '';
     $('#in-hint').textContent = o.hint || '';
-    askKeep = !!o.keep; askAt = Date.now();
+    askKeep = !!o.keep; askStay = !!o.stay; askAt = Date.now();
     askDone = resolve;
     const first = !st.typing;
-    st.typing = true; syncMouse(); render();
+    st.keys = false;                       // the field takes over the keyboard that a search box may have held
+    st.typing = true; if (st.parked) setParked(false); syncMouse(); render();
     window.qazi.setTyping(true).then((ctx) => {
       if (first && ctx && ctx.title !== undefined) st.ctx = ctx;        // what the user was looking at before
       if (o.fill && !inText.value) inText.value = o.fill() || '';
@@ -1423,13 +1410,50 @@ inText.addEventListener('keydown', (e) => {
 });
 $('#in-ok').addEventListener('click', () => answer(inText.value));
 $('#in-cancel').addEventListener('click', () => answer(null));
-// clicking somewhere else puts the field away (without pulling the focus back)
+// clicking somewhere else puts the field away (without pulling the focus back) — or, for the password steps,
+// leaves it waiting on the pill
 window.addEventListener('blur', () => {
-  if (!st.typing || Date.now() - askAt < 500) return;
+  if (st.keys) {
+    st.keys = false; if (!st.typing) window.qazi.setTyping(false, false);
+    if (st.stackOpen && st.stackKind === 'vault') markSel();
+  }
+  if (!st.typing || st.parked) return;
+  if (askStay) {
+    setTimeout(() => {
+      if (st.typing && !st.parked && askStay && !document.hasFocus()) { setParked(true); window.qazi.setTyping(false, false); }
+    }, 250);
+    return;
+  }
+  if (Date.now() - askAt < 500) return;
   const d = askDone; askDone = null;
   closeTyping(false);
   if (d) d(null);
 });
+// back on the waiting field: it takes the keyboard again (its buttons work without that)
+views.input.addEventListener('pointerdown', (e) => {
+  if (!st.parked || e.target.closest('button')) return;
+  setParked(false);
+  window.qazi.setTyping(true).then(() => setTimeout(() => inText.focus(), 40));
+});
+
+// a search box under the pill borrows the keyboard the same way, and gives it back when it is done
+function holdKeys(then) {
+  if (st.keys || st.typing) { if (then) then(); return; }
+  st.keys = true;
+  // the page only gets the keyboard once Windows has brought the window forward: focus after that
+  window.qazi.setTyping(true).then(() => setTimeout(() => { if (st.keys && then) then(); }, 90));
+}
+window.addEventListener('focus', () => {
+  const q = $('#v-search');
+  if (st.keys && q && st.stackOpen && st.stackKind === 'vault' && document.activeElement !== q) q.focus();
+});
+// buttons under the pill never take the focus away from a search box
+stackEl.addEventListener('mousedown', (e) => { if (e.target.closest('button')) e.preventDefault(); });
+function releaseKeys(restore) {
+  if (!st.keys) return;
+  st.keys = false;
+  if (!st.typing) window.qazi.setTyping(false, !!restore);
+}
 
 // ------------------------------------------------------------ quick notes
 // Jot a line and it is kept. A time in the line ("call Ali in 20m", "at 18:30 gym", "۱۰ دقیقه دیگه چای")
@@ -1544,60 +1568,149 @@ async function newGen() {
   st.gen.pass = await window.qazi.vaultGenerate(st.gen.len, st.gen.symbols);
   $('#g-pass').textContent = st.gen.pass; $('#g-len').textContent = st.gen.len;
   $('#g-sym').classList.toggle('off', !st.gen.symbols);
-  st.gen.until = Date.now() + 30000; render();
+  render();
 }
+// the fresh password stays on the pill until it is used (✓) or put away (✕), whatever else is clicked meanwhile
 async function openGen() { setStack(false); await newGen(); st.manual = 'gen'; render(); }
+$('#g-cancel').addEventListener('click', () => { st.manual = null; st.gen.pass = ''; $('#g-pass').textContent = ''; st.leftAt = Date.now(); render(); });
 $('#g-again').addEventListener('click', newGen);
 $('#g-minus').addEventListener('click', () => { st.gen.len = clamp(st.gen.len - 2, 8, 40); window.qazi.setSetting('vaultLength', st.gen.len); newGen(); });
 $('#g-plus').addEventListener('click', () => { st.gen.len = clamp(st.gen.len + 2, 8, 40); window.qazi.setSetting('vaultLength', st.gen.len); newGen(); });
 $('#g-sym').addEventListener('click', () => { st.gen.symbols = !st.gen.symbols; window.qazi.setSetting('vaultSymbols', st.gen.symbols); newGen(); });
 $('#g-ok').addEventListener('click', async () => {
-  const pass = st.gen.pass; st.manual = null; st.gen.until = 0;
+  const pass = st.gen.pass; st.manual = null;
+  const ctx = await window.qazi.fgContext();          // the page it is for, read before anything takes the focus from it
+  if (ctx && ctx.title !== undefined) st.ctx = ctx;
   await window.qazi.copySecret(pass);                 // ready to paste into the sign-up form right away
   saveLogin(pass, true);
 });
+// A password is kept the moment it is made (or typed in), under the name the window suggests. The questions after
+// that only name it: leaving them halfway, or for good, never loses the password.
 async function saveLogin(pass, generated) {
   if (!generated) {
-    pass = await ask({ icon: 'key', placeholder: 'Type or paste the password', secret: true, hint: '1/3', keep: true });
+    pass = await ask({ icon: 'key', placeholder: 'Type or paste the password', secret: true, hint: '1/3', keep: true, stay: true });
     if (!pass) { if (pass !== null) closeTyping(true); return; }
   }
+  const guess = guessSite(st.ctx) || 'Untitled';
+  const id = await window.qazi.vaultSave(guess, '', pass);
+  if (!id) {
+    closeTyping(true);
+    showHud('key', 'Could not save', generated ? 'the password is still on your clipboard' : '', 3200, 'faded');
+    return;
+  }
   const n = generated ? 2 : 3;
-  const site = await ask({ icon: 'key', placeholder: 'What is it for?  (site or app)', fill: () => guessSite(st.ctx), hint: (n - 1) + '/' + n, keep: true });
-  if (site === null) { showHud('key', 'Not saved', generated ? 'the password is still on your clipboard' : '', 2200, 'faded'); return; }
-  const user = await ask({ icon: 'user', placeholder: 'Email or username', value: st.lastUser, hint: n + '/' + n });
-  if (user === null) { showHud('key', 'Not saved', '', 1800, 'faded'); return; }
-  const ok = await window.qazi.vaultSave(site, user, pass);
-  showHud('key', ok ? 'Saved' : 'Could not save', ok ? (site || 'Untitled') + (generated ? ' · password is on your clipboard' : '') : '', 2600, ok ? 'green pop' : 'faded');
-  if (ok) emote('happy', 1200);
+  const site = await ask({ icon: 'key', placeholder: 'Saved. What is it for?  (site or app)', value: guess === 'Untitled' ? '' : guess, hint: (n - 1) + '/' + n, keep: true, stay: true });
+  if (site === null) { showHud('key', 'Saved as ' + guess, 'rename it any time under Passwords', 2800, 'green'); return; }
+  const name = site.trim() || guess;
+  const user = await ask({ icon: 'user', placeholder: 'Email or username', value: st.lastUser, hint: n + '/' + n, stay: true });
+  const ok = await window.qazi.vaultEdit(id, name, user === null ? '' : user);
+  showHud('key', 'Saved', name + (ok ? '' : ' · the name could not be changed') + (generated ? ' · password is on your clipboard' : ''), 2600, ok ? 'green pop' : 'faded');
+  emote('happy', 1200);
+}
+// rename an entry / fix its username (the password stays)
+async function editLogin(v) {
+  const site = await ask({ icon: 'key', placeholder: 'Site or app', value: v.site, hint: '1/2', keep: true, stay: true });
+  if (site === null) return;
+  const user = await ask({ icon: 'user', placeholder: 'Email or username', value: v.user, hint: '2/2', stay: true });
+  if (user === null) return;
+  const ok = await window.qazi.vaultEdit(v.id, site, user);
+  showHud('key', ok ? 'Updated' : 'Could not update', site.trim() || 'Untitled', 2000, ok ? 'green' : 'faded');
+}
+// The list stays open while you go back and forth to the page you are signing in to. A search box on top
+// narrows it; Enter copies the password of the highlighted row, Shift+Enter its username, Esc clears / closes.
+function vaultFound() {
+  const q = st.vaultQ.trim().toLowerCase();
+  if (!q) return st.vault.items;
+  const words = q.split(/\s+/);
+  const rank = (v) => { const s = (v.site || '').toLowerCase(); return s.startsWith(q) ? 0 : s.includes(q) ? 1 : 2; };
+  return st.vault.items
+    .filter((v) => { const hay = ((v.site || '') + ' ' + (v.user || '')).toLowerCase(); return words.every((w) => hay.includes(w)); })
+    .sort((a, b) => rank(a) - rank(b));
+}
+function markSel() {
+  const on = !!(st.vaultQ.trim() || st.keys);
+  $$('#stack-list .row.vault').forEach((r, i) => {
+    r.classList.toggle('sel', on && i === st.vaultSel);
+    if (on && i === st.vaultSel) r.scrollIntoView({ block: 'nearest' });
+  });
+}
+async function copyLogin(v, what) {
+  const ok = await window.qazi.vaultCopy(v.id, what);
+  flash(!ok ? 'Could not copy' : what === 'user' ? 'Username copied' : 'Password copied — clears in 30s');
+  if (!ok) return;
+  const btn = stackList.querySelector(`.row.vault[data-id="${v.id}"] .act.${what}`);
+  if (btn) {
+    btn.classList.add('ok'); btn.innerHTML = svg('check');
+    setTimeout(() => { btn.classList.remove('ok'); btn.innerHTML = svg(what === 'user' ? 'user' : 'key'); }, 1500);
+  }
+  releaseKeys(true);       // straight back to the page being filled in, so Ctrl+V pastes there
+}
+function vaultHead() {
+  if (stackHead.dataset.kind === 'vault') return;
+  stackHead.dataset.kind = 'vault'; stackHead.textContent = ''; stackHead.classList.add('on');
+  const box = document.createElement('label'); box.className = 'search'; box.innerHTML = svg('search');
+  const q = document.createElement('input'); q.id = 'v-search'; q.type = 'text'; q.spellcheck = false; q.autocomplete = 'off'; q.dir = 'auto';
+  q.placeholder = 'Search'; q.value = st.vaultQ;
+  box.title = 'Enter copies the password · Shift+Enter the username · Esc clears';
+  box.appendChild(q);
+  box.addEventListener('pointerdown', () => { holdKeys(() => q.focus()); markSel(); });
+  q.addEventListener('focus', () => { holdKeys(); markSel(); });
+  q.addEventListener('input', () => { st.vaultQ = q.value; st.vaultSel = 0; renderStack(); stackList.scrollTop = 0; });
+  q.addEventListener('keydown', (e) => {
+    const list = vaultFound();
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      st.vaultSel = clamp(st.vaultSel + (e.key === 'ArrowDown' ? 1 : -1), 0, Math.max(0, list.length - 1)); markSel();
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      const v = list[st.vaultSel]; if (v) copyLogin(v, e.shiftKey ? 'user' : 'pass');
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      if (q.value) { q.value = ''; st.vaultQ = ''; st.vaultSel = 0; renderStack(); } else setStack(false);
+    }
+  });
+  const btn = (icon, label, title, fn) => {
+    const b = document.createElement('button'); b.className = 'pillbtn'; b.title = title;
+    b.innerHTML = svg(icon) + (label ? `<span>${label}</span>` : ''); b.addEventListener('click', fn); return b;
+  };
+  const g = btn('bolt', 'New', 'Make a new password', openGen);
+  const a = btn('plus', 'Add', 'Save a password you already have', () => { setStack(false); saveLogin('', false); });
+  const x = btn('close', '', 'Close the passwords', () => setStack(false)); x.classList.add('round');
+  stackHead.append(box, g, a, x);
 }
 function renderVault() {
   $('#stack-clear').classList.add('hidden');
-  const acts = document.createElement('div'); acts.className = 'row actions';
-  const g = document.createElement('button'); g.innerHTML = svg('bolt') + 'New password';
-  const a = document.createElement('button'); a.innerHTML = svg('plus') + 'Add existing';
-  g.addEventListener('click', openGen);
-  a.addEventListener('click', () => { setStack(false); saveLogin('', false); });
-  acts.append(g, a); stackList.appendChild(acts);
-  if (st.vault.locked) {
-    const e = document.createElement('div'); e.className = 'row empty wide'; e.textContent = 'Saved passwords could not be opened on this account';
-    stackList.appendChild(e);
-  }
-  st.vault.items.forEach((v, i) => {
-    const row = document.createElement('div'); row.className = 'row vault'; row.style.setProperty('--i', Math.min(i + 1, 6));
+  vaultHead();
+  const note = (text) => { const e = document.createElement('div'); e.className = 'row empty wide'; e.textContent = text; stackList.appendChild(e); };
+  if (st.vault.locked) note('Saved passwords could not be opened on this account');
+  const list = vaultFound();
+  st.vaultSel = clamp(st.vaultSel, 0, Math.max(0, list.length - 1));
+  if (!st.vault.items.length) { if (!st.vault.locked) note('No passwords yet — New makes one'); return; }
+  if (!list.length) { note('Nothing matches “' + st.vaultQ.trim() + '”'); return; }
+  const showSel = !!(st.vaultQ.trim() || st.keys);
+  list.forEach((v, i) => {
+    const row = document.createElement('div'); row.className = 'row vault' + (showSel && i === st.vaultSel ? ' sel' : ''); row.style.setProperty('--i', Math.min(i + 1, 6));
+    row.dataset.id = v.id;
     row.title = 'Click to copy the password (it leaves the clipboard after 30 seconds)';
     const ic = document.createElement('div'); ic.className = 'ic'; ic.textContent = (v.site || '•').trim().charAt(0).toUpperCase();
     const box = document.createElement('span'); box.className = 'mqbox'; box.dir = 'auto';
-    const mq = document.createElement('span'); mq.className = 'mq'; const b = document.createElement('b'); b.textContent = v.site; mq.appendChild(b);
+    const mq = document.createElement('span'); mq.className = 'mq'; const b = document.createElement('b'); b.textContent = v.site || 'Untitled'; mq.appendChild(b);
     box.appendChild(mq);
     const who = document.createElement('span'); who.className = 'who dim'; who.textContent = v.user; who.dir = 'ltr';
-    const cu = document.createElement('button'); cu.className = 'act'; cu.title = 'Copy the email / username'; cu.innerHTML = svg('user');
+    const cu = document.createElement('button'); cu.className = 'act user'; cu.title = 'Copy the email / username'; cu.innerHTML = svg('user');
+    const cp = document.createElement('button'); cp.className = 'act pass'; cp.title = 'Copy the password'; cp.innerHTML = svg('key');
     const ey = document.createElement('button'); ey.className = 'act'; ey.title = 'Show the password for a moment'; ey.innerHTML = svg('eye');
+    const ed = document.createElement('button'); ed.className = 'act'; ed.title = 'Rename / change the username'; ed.innerHTML = svg('edit');
     const x = document.createElement('button'); x.className = 'x show'; x.title = 'Delete'; x.innerHTML = svg('close');
     row.append(ic, box, who);
     if (v.user) row.appendChild(cu);
-    row.append(ey, x);
-    row.addEventListener('click', async () => { const ok = await window.qazi.vaultCopy(v.id, 'pass'); flash(ok ? 'Password copied — clears in 30s' : 'Could not copy'); });
-    cu.addEventListener('click', (e) => { e.stopPropagation(); window.qazi.vaultCopy(v.id, 'user'); flash('Username copied'); });
+    row.append(cp, ey, ed, x);
+    ed.addEventListener('click', (e) => { e.stopPropagation(); editLogin(v); });
+    row.addEventListener('mouseenter', () => startMarquee(box));
+    row.addEventListener('mouseleave', () => stopMarquee(box));
+    row.addEventListener('click', () => { st.vaultSel = i; markSel(); copyLogin(v, 'pass'); });
+    cu.addEventListener('click', (e) => { e.stopPropagation(); st.vaultSel = i; markSel(); copyLogin(v, 'user'); });
+    cp.addEventListener('click', (e) => { e.stopPropagation(); st.vaultSel = i; markSel(); copyLogin(v, 'pass'); });
     ey.addEventListener('click', async (e) => {
       e.stopPropagation();
       const p = await window.qazi.vaultReveal(v.id); if (!p) return;
