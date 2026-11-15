@@ -23,6 +23,7 @@
           "gnome-screenshot",
           "spectacle",
           "playerctl",
+          "pulseaudio-utils",
           "wl-clipboard",
           "xclip",
           "xsel",

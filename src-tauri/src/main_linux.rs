@@ -4,10 +4,11 @@ use std::{
     collections::HashSet,
     fs,
     io::{Cursor, Read, Write},
+    os::fd::AsRawFd,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     ptr,
-    sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Mutex, OnceLock},
+    sync::{atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering}, Mutex, OnceLock},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -45,6 +46,9 @@ static X11_LIB: OnceLock<x11_dl::xlib::Xlib> = OnceLock::new();
 static INPUT_INTERACTIVE: AtomicBool = AtomicBool::new(false);
 static INPUT_HEARTBEAT: AtomicU64 = AtomicU64::new(0);
 static TYPING_ACTIVE: AtomicBool = AtomicBool::new(false);
+static VIZ_ACTIVE: AtomicBool = AtomicBool::new(false);
+static VIZ_STARTED: AtomicBool = AtomicBool::new(false);
+static VIZ_PID: AtomicU32 = AtomicU32::new(0);
 static PREVIOUS_X11_WINDOW: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 fn previous_x11_window() -> &'static Mutex<Option<String>> {
@@ -1873,8 +1877,180 @@ fn set_volume(v: f64) { set_volume_value(v.clamp(0.0, 1.0) as f32); }
 #[tauri::command]
 fn toggle_mute() { toggle_mute_value(); }
 
+// ---------------------------------------------------------------- system-output visualizer (PulseAudio / PipeWire-Pulse monitor)
+const VIZ_BANDS: usize = 24;
+const VIZ_FFT_SIZE: usize = 1024;
+
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+unsafe extern "C" {
+    fn poll(fds: *mut PollFd, nfds: usize, timeout: i32) -> i32;
+}
+
+fn fft(re: &mut [f32], im: &mut [f32]) {
+    let n = re.len();
+    let mut j = 0usize;
+    for i in 1..n {
+        let mut bit = n >> 1;
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j ^= bit;
+        if i < j {
+            re.swap(i, j);
+            im.swap(i, j);
+        }
+    }
+    let mut len = 2;
+    while len <= n {
+        let ang = -2.0 * std::f32::consts::PI / len as f32;
+        let (wr, wi) = (ang.cos(), ang.sin());
+        let half = len / 2;
+        let mut i = 0;
+        while i < n {
+            let (mut cr, mut ci) = (1.0f32, 0.0f32);
+            for k in 0..half {
+                let (a, b) = (i + k, i + k + half);
+                let (vr, vi) = (re[b] * cr - im[b] * ci, re[b] * cr * 0.0 + im[b] * cr + re[b] * ci);
+                let (ur, ui) = (re[a], im[a]);
+                re[a] = ur + vr;
+                im[a] = ui + vi;
+                re[b] = ur - vr;
+                im[b] = ui - vi;
+                let ncr = cr * wr - ci * wi;
+                ci = cr * wi + ci * wr;
+                cr = ncr;
+            }
+            i += len;
+        }
+        len <<= 1;
+    }
+}
+
+fn visualizer_capture() -> bool {
+    if !command_exists("parec") {
+        log("Audio visualizer unavailable: install pulseaudio-utils (parec) and a PulseAudio-compatible PipeWire service");
+        return false;
+    }
+    let mut child = match Command::new("parec")
+        .args([
+            "--raw", "--format=s16le", "--rate=48000", "--channels=2",
+            "--latency-msec=20", "--device=@DEFAULT_MONITOR@",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            log(&format!("Could not start audio monitor capture: {error}"));
+            return false;
+        }
+    };
+    VIZ_PID.store(child.id(), Ordering::SeqCst);
+    let Some(stdout) = child.stdout.as_mut() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        VIZ_PID.store(0, Ordering::SeqCst);
+        return false;
+    };
+    let fd = stdout.as_raw_fd();
+    let n = VIZ_FFT_SIZE;
+    let window: Vec<f32> = (0..n).map(|i| {
+        let x = i as f32 / n as f32;
+        0.42 - 0.5 * (2.0 * std::f32::consts::PI * x).cos()
+            + 0.08 * (4.0 * std::f32::consts::PI * x).cos()
+    }).collect();
+    let mut re = vec![0.0f32; n];
+    let mut im = vec![0.0f32; n];
+    let mut smooth = vec![0.0f32; n / 2];
+    let mut bytes = vec![0u8; n * 4];
+    let mut last_emit = Instant::now();
+
+    while VIZ_ACTIVE.load(Ordering::SeqCst) {
+        let mut descriptor = PollFd { fd, events: 1, revents: 0 };
+        let ready = unsafe { poll(&mut descriptor, 1, 120) };
+        if ready < 0 {
+            log("Audio visualizer pipe polling failed");
+            break;
+        }
+        if ready == 0 {
+            if child.try_wait().ok().flatten().is_some() { break; }
+            continue;
+        }
+        if descriptor.revents & (0x08 | 0x10) != 0 { // error or hangup
+            break;
+        }
+        if stdout.read_exact(&mut bytes).is_err() { break; }
+
+        for i in 0..n {
+            let p = i * 4;
+            let left = i16::from_le_bytes([bytes[p], bytes[p + 1]]) as f32 / 32768.0;
+            let right = i16::from_le_bytes([bytes[p + 2], bytes[p + 3]]) as f32 / 32768.0;
+            re[i] = (left + right) * 0.5 * window[i];
+            im[i] = 0.0;
+        }
+        fft(&mut re, &mut im);
+
+        let mut peak = 0.0f32;
+        for k in 0..n / 2 {
+            let magnitude = (re[k] * re[k] + im[k] * im[k]).sqrt() / n as f32;
+            smooth[k] = 0.61 * smooth[k] + 0.39 * magnitude;
+            peak = peak.max(smooth[k]);
+        }
+
+        let byte = |k: usize| -> f32 {
+            let db = 20.0 * smooth[k.min(n / 2 - 1)].max(1e-10).log10();
+            ((db + 100.0) / 70.0 * 255.0).clamp(0.0, 255.0)
+        };
+        let mut levels = [0.0f32; VIZ_BANDS];
+        for (i, level) in levels.iter_mut().enumerate() {
+            let a = ((i as f32 / VIZ_BANDS as f32).powf(1.9) * 300.0).floor() as usize + 1;
+            let b = (((i + 1) as f32 / VIZ_BANDS as f32).powf(1.9) * 300.0).floor() as usize + 1;
+            let b = b.max(a + 1);
+            let sum: f32 = (a..b).map(byte).sum();
+            let value = (sum / (b - a) as f32 / 255.0).powf(1.5)
+                * (1.0 + i as f32 / VIZ_BANDS as f32 * 0.9);
+            *level = (value * 1000.0).round() / 1000.0;
+        }
+
+        if peak > 1e-7 || last_emit.elapsed() >= Duration::from_millis(90) {
+            emit("levels", levels.to_vec());
+            last_emit = Instant::now();
+        }
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    VIZ_PID.store(0, Ordering::SeqCst);
+    emit("levels", vec![0.0f32; VIZ_BANDS]);
+    true
+}
+
+fn visualizer_start() {
+    if VIZ_STARTED.swap(true, Ordering::SeqCst) { return; }
+    thread::spawn(|| loop {
+        if VIZ_ACTIVE.load(Ordering::SeqCst) {
+            if !visualizer_capture() {
+                thread::sleep(Duration::from_secs(3));
+            }
+        } else {
+            thread::sleep(Duration::from_millis(250));
+        }
+    });
+}
+
 #[tauri::command]
-fn set_viz(_on: bool) {}
+fn set_viz(on: bool) {
+    VIZ_ACTIVE.store(on, Ordering::SeqCst);
+}
 
 #[tauri::command]
 fn notif_act(_id: String, _aumid: String) {}
@@ -2406,6 +2582,7 @@ fn main() {
             x11_pointer_watch();
             interaction_watchdog_start();
             poll_start();
+            visualizer_start();
             settings_broadcast();
             emit("notes", notes_payload(&notes().lock().unwrap()));
             emit("vault", vault_payload());
