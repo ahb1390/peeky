@@ -1084,39 +1084,33 @@ fn poll_start() {
 }
 
 // ---------------------------------------------------------------- window, tray and application commands
-fn apply_wayland_input_region(
+fn apply_linux_input_region(
     window: tauri::WebviewWindow,
-    interactive: bool,
-    idle_region: Option<(f64, f64, f64, f64)>,
+    input_region: Option<(f64, f64, f64, f64)>,
 ) {
     let target = window.clone();
     let _ = window.run_on_main_thread(move || {
         if let Ok(gtk_window) = target.gtk_window() {
-            if interactive {
-                // The WebView receives the complete window while the user is interacting.
-                gtk_window.input_shape_combine_region(None);
-            } else {
-                // In idle mode only the resting 84x36 pill (or its visible tucked handle)
-                // receives pointer input. Do not leave a large invisible rectangle over apps.
-                let (x, y, width, height) = idle_region
-                    .filter(|(x, y, w, h)| {
-                        x.is_finite() && y.is_finite()
-                            && w.is_finite() && h.is_finite()
-                            && *x >= -WIN_W && *x <= WIN_W
-                            && *y >= -WIN_H && *y <= WIN_H
-                            && *w >= 1.0 && *w <= WIN_W
-                            && *h >= 1.0 && *h <= WIN_H
-                    })
-                    .map(|(x, y, w, h)| (x.round() as i32, y.round() as i32, w.round() as i32, h.round() as i32))
-                    // Before the UI bridge has measured the pill, keep a narrow startup target
-                    // covering both the normal resting position and the three-pixel tucked handle.
-                    .unwrap_or((308, 0, 84, 44));
-                let rect = RectangleInt::new(x, y, width, height);
-                let region = Region::create_rectangle(&rect);
-                gtk_window.input_shape_combine_region(Some(&region));
-            }
-            // The GTK 3 Wayland backend commits pending input-region changes during paint.
-            // Queue a redraw so click-through changes take effect even while the pill is idle.
+            // Keep the native hit-test region aligned to visible UI on both X11 and Wayland.
+            // The transparent 700x430 WebView must never become a full-window click blocker.
+            let (x, y, width, height) = input_region
+                .filter(|(x, y, w, h)| {
+                    x.is_finite() && y.is_finite()
+                        && w.is_finite() && h.is_finite()
+                        && *x >= -WIN_W && *x <= WIN_W
+                        && *y >= -WIN_H && *y <= WIN_H
+                        && *w >= 1.0 && *w <= WIN_W
+                        && *h >= 1.0 && *h <= WIN_H
+                })
+                .map(|(x, y, w, h)| (x.round() as i32, y.round() as i32, w.round() as i32, h.round() as i32))
+                // Before the UI bridge has measured the island, expose only a compact
+                // startup target covering its resting pill and the tucked handle.
+                .unwrap_or((308, 0, 84, 44));
+            let rect = RectangleInt::new(x, y, width, height);
+            let region = Region::create_rectangle(&rect);
+            gtk_window.input_shape_combine_region(Some(&region));
+            // GTK commits pending input-region changes during paint on Wayland; queuing
+            // a redraw also keeps the X11 shape in sync with menu geometry.
             gtk_window.queue_draw();
         }
     });
@@ -1125,22 +1119,14 @@ fn apply_wayland_input_region(
 fn set_input_interactive(
     window: tauri::WebviewWindow,
     on: bool,
-    idle_region: Option<(f64, f64, f64, f64)>,
+    input_region: Option<(f64, f64, f64, f64)>,
 ) {
     INPUT_INTERACTIVE.store(on, Ordering::SeqCst);
     INPUT_HEARTBEAT.store(now_ms(), Ordering::SeqCst);
-    if is_wayland() {
-        // Apply the same compact input region with and without layer-shell. The fallback
-        // decorated window must not capture clicks across its full transparent 700x430 area.
-        apply_wayland_input_region(window, on, idle_region);
-    } else if X11_POINTER_ACTIVE.load(Ordering::SeqCst) {
-        if let Err(error) = window.set_ignore_cursor_events(!on) {
-            log(&format!("set_ignore_cursor_events failed: {error}"));
-        }
-    } else {
-        // No pointer tracker means hover cannot be detected reliably; leave a usable window.
-        let _ = window.set_ignore_cursor_events(false);
-    }
+    // Never switch the whole native window to interactive mode. The bridge supplies a
+    // measured region covering only the currently visible pill, menu, list and side chip.
+    // If the renderer has not supplied geometry yet, the compact startup target is safe.
+    apply_linux_input_region(window, input_region);
 }
 
 fn set_interactive_window(
@@ -1227,10 +1213,22 @@ fn restore_previous_x11_window() {
 }
 
 #[tauri::command]
-fn set_typing(window: tauri::WebviewWindow, on: bool, restore: bool) -> Value {
+fn set_typing(
+    window: tauri::WebviewWindow,
+    on: bool,
+    restore: bool,
+    x: Option<f64>,
+    y: Option<f64>,
+    width: Option<f64>,
+    height: Option<f64>,
+) -> Value {
     let context = if on { capture_previous_x11_window() } else { json!({}) };
     TYPING_ACTIVE.store(on, Ordering::SeqCst);
-    set_input_interactive(window.clone(), on, None);
+    let input_region = match (x, y, width, height) {
+        (Some(x), Some(y), Some(width), Some(height)) => Some((x, y, width, height)),
+        _ => None,
+    };
+    set_input_interactive(window.clone(), on, input_region);
     if on {
         if let Err(error) = window.set_focus() {
             log(&format!("Could not focus the Peeky input field: {error}"));
@@ -1608,16 +1606,15 @@ fn x11_pointer_watch() {
     if is_wayland() { return; }
     let Some(xlib) = X11_LIB.get() else {
         X11_POINTER_ACTIVE.store(false, Ordering::SeqCst);
-        if let Some(window) = APP.get().and_then(|app| app.get_webview_window("main")) {
-            let _ = window.set_ignore_cursor_events(false);
-        }
+        // The compact GTK input region remains active; the WebView bridge supplies
+        // local pointer events even when global X11 polling is unavailable.
         return;
     };
     let Some(window) = APP.get().and_then(|app| app.get_webview_window("main")) else { return; };
     let Some(own_window_id) = x11_native_window_id(&window) else {
         log("Could not obtain Peeky's native X11 window id; pointer tracking is disabled");
         X11_POINTER_ACTIVE.store(false, Ordering::SeqCst);
-        let _ = window.set_ignore_cursor_events(false);
+        // Keep the measured GTK input shape. DOM pointer events remain the fallback.
         return;
     };
 
@@ -1626,7 +1623,6 @@ fn x11_pointer_watch() {
         if display.is_null() {
             log("XOpenDisplay failed; pointer tracking is disabled");
             X11_POINTER_ACTIVE.store(false, Ordering::SeqCst);
-            let _ = window.set_ignore_cursor_events(false);
             return;
         }
         let root = (xlib.XDefaultRootWindow)(display);
@@ -1634,7 +1630,6 @@ fn x11_pointer_watch() {
             log("Could not resolve Peeky's top-level X11 window; pointer tracking is disabled");
             (xlib.XCloseDisplay)(display);
             X11_POINTER_ACTIVE.store(false, Ordering::SeqCst);
-            let _ = window.set_ignore_cursor_events(false);
             return;
         };
 
@@ -1794,12 +1789,9 @@ fn main() {
             }
 
             let _ = window.show();
-            if is_wayland() {
-                // Restrict even the ordinary decorated fallback window to the visible pill.
-                apply_wayland_input_region(window.clone(), false, None);
-            } else {
-                let _ = window.set_ignore_cursor_events(true);
-            }
+            // Start with a compact hit target on every Linux display server. The bridge
+            // expands it only around controls that are actually visible.
+            apply_linux_input_region(window.clone(), None);
 
             create_tray(app)?;
             if setting_flag("autoStart") { set_autostart(true); }
