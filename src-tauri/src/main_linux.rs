@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     ptr,
-    sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Mutex, OnceLock},
+    sync::{atomic::{AtomicBool, AtomicU64, Ordering}, mpsc, Mutex, OnceLock},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -36,6 +36,7 @@ const WIN_H: f64 = 430.0;
 const MAX_SHELF_BYTES: usize = 200 * 1024 * 1024;
 
 static APP: OnceLock<tauri::AppHandle> = OnceLock::new();
+static GTK_MAIN_THREAD_ID: OnceLock<thread::ThreadId> = OnceLock::new();
 static SETTINGS: OnceLock<Mutex<Map<String, Value>>> = OnceLock::new();
 static NOTES: OnceLock<Mutex<Vec<Note>>> = OnceLock::new();
 static VAULT: OnceLock<Mutex<Vec<VaultItem>>> = OnceLock::new();
@@ -121,6 +122,73 @@ fn log(message: &str) {
     if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(file, "[{}] {}", now_ms(), message);
     }
+}
+
+// GTK owns the desktop clipboard on both X11 and Wayland. Run clipboard operations on
+// GTK's UI thread so image/text support does not depend on wl-clipboard or xclip.
+fn gtk_main_call<T, F>(task: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    if GTK_MAIN_THREAD_ID
+        .get()
+        .is_some_and(|main_id| *main_id == thread::current().id())
+    {
+        return Some(task());
+    }
+
+    let window = APP.get()?.get_webview_window("main")?;
+    let (sender, receiver) = mpsc::sync_channel(1);
+    window.run_on_main_thread(move || {
+        let value = task();
+        let _ = sender.send(value);
+    }).ok()?;
+    receiver.recv_timeout(Duration::from_secs(4)).ok()
+}
+
+fn gtk_clipboard_read_text() -> Option<String> {
+    gtk_main_call(|| {
+        let display = gtk::gdk::Display::default()?;
+        let clipboard = gtk::Clipboard::default(&display)?;
+        clipboard.wait_for_text().map(|text| text.to_string())
+    }).flatten()
+}
+
+fn gtk_clipboard_write_text(text: &str, persist: bool) -> bool {
+    let text = text.to_string();
+    gtk_main_call(move || {
+        let Some(display) = gtk::gdk::Display::default() else { return false; };
+        let Some(clipboard) = gtk::Clipboard::default(&display) else { return false; };
+        clipboard.set_text(&text);
+        if persist {
+            clipboard.store();
+        }
+        true
+    }).unwrap_or(false)
+}
+
+fn gtk_clipboard_read_image() -> Option<Vec<u8>> {
+    gtk_main_call(|| {
+        let display = gtk::gdk::Display::default()?;
+        let clipboard = gtk::Clipboard::default(&display)?;
+        let pixbuf = clipboard.wait_for_image()?;
+        pixbuf.save_to_bufferv("png", &[]).ok()
+    }).flatten()
+}
+
+fn gtk_clipboard_write_png(bytes: &[u8]) -> bool {
+    let bytes = bytes.to_vec();
+    gtk_main_call(move || {
+        let Ok(pixbuf) = gtk::gdk_pixbuf::Pixbuf::from_read(Cursor::new(bytes)) else {
+            return false;
+        };
+        let Some(display) = gtk::gdk::Display::default() else { return false; };
+        let Some(clipboard) = gtk::Clipboard::default(&display) else { return false; };
+        clipboard.set_image(&pixbuf);
+        clipboard.store();
+        true
+    }).unwrap_or(false)
 }
 
 fn output(program: &str, args: &[&str]) -> Option<String> {
@@ -351,60 +419,57 @@ fn clipboard_read() -> Option<String> {
             return Some(text.trim_end_matches('\0').to_string());
         }
     }
-    None
+    gtk_clipboard_read_text()
 }
 
 fn clipboard_write(text: &str, private: bool) -> bool {
     let wayland = is_wayland();
     let program = if wayland {
-        if command_exists("wl-copy") {
-            "wl-copy"
-        } else {
-            log("Clipboard copy failed: install wl-clipboard (wl-copy) in this Wayland session");
-            return false;
-        }
+        command_exists("wl-copy").then_some("wl-copy")
     } else if command_exists("xclip") {
-        "xclip"
+        Some("xclip")
     } else if command_exists("xsel") {
-        "xsel"
+        Some("xsel")
     } else {
-        log("Clipboard copy failed: install xclip or xsel in this X11 session");
-        return false;
+        None
     };
 
-    let mut cmd = Command::new(program);
-    if wayland {
-        if private { cmd.arg("--sensitive"); }
-    } else if program == "xclip" {
-        cmd.args(["-selection", "clipboard", "-i"]);
-    } else {
-        cmd.args(["--clipboard", "--input"]);
-    }
-
-    let mut child = match cmd.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            log(&format!("Clipboard copy failed to start {program}: {error}"));
-            return false;
+    if let Some(program) = program {
+        let mut cmd = Command::new(program);
+        if wayland {
+            if private { cmd.arg("--sensitive"); }
+        } else if program == "xclip" {
+            cmd.args(["-selection", "clipboard", "-i"]);
+        } else {
+            cmd.args(["--clipboard", "--input"]);
         }
-    };
-    let Some(mut stdin) = child.stdin.take() else {
-        let _ = child.kill();
-        log(&format!("Clipboard copy failed: {program} did not accept standard input"));
-        return false;
-    };
-    if let Err(error) = stdin.write_all(text.as_bytes()) {
-        let _ = child.kill();
-        log(&format!("Clipboard copy failed while writing to {program}: {error}"));
-        return false;
-    }
-    drop(stdin);
 
-    // Clipboard owners must remain alive until another application requests/replaces the
-    // selection. Reap them on a background thread; never block the Tauri command on this.
-    thread::spawn(move || { let _ = child.wait(); });
-    *last_clipboard().lock().unwrap() = text.to_string();
-    true
+        match cmd.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+            Ok(mut child) => {
+                if let Some(mut stdin) = child.stdin.take() {
+                    if stdin.write_all(text.as_bytes()).is_ok() {
+                        drop(stdin);
+                        // Clipboard owners remain alive until another application requests
+                        // or replaces the selection. Reap them without blocking the caller.
+                        thread::spawn(move || { let _ = child.wait(); });
+                        *last_clipboard().lock().unwrap() = text.to_string();
+                        return true;
+                    }
+                }
+                let _ = child.kill();
+                log(&format!("Clipboard helper {program} failed while writing; trying GTK clipboard"));
+            }
+            Err(error) => log(&format!("Could not start clipboard helper {program}: {error}; trying GTK clipboard")),
+        }
+    }
+
+    let copied = gtk_clipboard_write_text(text, !private);
+    if copied {
+        *last_clipboard().lock().unwrap() = text.to_string();
+    } else {
+        log("Clipboard copy failed: both the native helper and GTK clipboard were unavailable");
+    }
+    copied
 }
 
 fn clip_image_dir() -> PathBuf {
@@ -492,7 +557,7 @@ fn clipboard_read_image() -> Option<Vec<u8>> {
             return Some(result.stdout);
         }
     }
-    None
+    gtk_clipboard_read_image()
 }
 
 fn clipboard_read_file_urls() -> Option<String> {
@@ -501,7 +566,15 @@ fn clipboard_read_file_urls() -> Option<String> {
     } else {
         ("xclip", &["-selection", "clipboard", "-o", "-t", "text/uri-list"])
     };
-    let value = output(program, args)?;
+    let value = output(program, args).or_else(|| {
+        gtk_main_call(|| {
+            let display = gtk::gdk::Display::default()?;
+            let clipboard = gtk::Clipboard::default(&display)?;
+            let uris = clipboard.wait_for_uris();
+            let text = uris.iter().map(|uri| uri.as_str()).collect::<Vec<_>>().join("\n");
+            (!text.is_empty()).then_some(text)
+        }).flatten()
+    })?;
     let urls = value.lines().filter(|line| {
         let line = line.trim();
         !line.is_empty() && !line.starts_with('#')
@@ -1425,30 +1498,36 @@ fn capture_fullscreen() -> Result<Vec<u8>, String> {
 }
 
 fn clipboard_write_png(bytes: &[u8]) -> bool {
-    let (program, args): (&str, &[&str]) = if is_wayland() {
-        if !command_exists("wl-copy") {
-            log("Image clipboard copy failed: install wl-clipboard");
-            return false;
-        }
-        ("wl-copy", &["--type", "image/png"])
+    let helper = if is_wayland() {
+        command_exists("wl-copy").then_some(("wl-copy", vec!["--type", "image/png"]))
     } else {
-        if !command_exists("xclip") {
-            log("Image clipboard copy failed: install xclip");
-            return false;
-        }
-        ("xclip", &["-selection", "clipboard", "-t", "image/png", "-i"])
+        command_exists("xclip").then_some(("xclip", vec!["-selection", "clipboard", "-t", "image/png", "-i"]))
     };
-    let Ok(mut child) = Command::new(program).args(args)
-        .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() else {
-            log(&format!("Image clipboard copy failed to start {program}"));
-            return false;
-        };
-    let Some(mut stdin) = child.stdin.take() else { let _ = child.kill(); return false; };
-    if stdin.write_all(bytes).is_err() { let _ = child.kill(); return false; }
-    drop(stdin);
-    *last_clipboard().lock().unwrap() = format!("image:{:016x}", image_hash(bytes));
-    thread::spawn(move || { let _ = child.wait(); });
-    true
+
+    if let Some((program, args)) = helper {
+        match Command::new(program).args(&args)
+            .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+            Ok(mut child) => {
+                let wrote = child.stdin.take().is_some_and(|mut stdin| stdin.write_all(bytes).is_ok());
+                if wrote {
+                    thread::spawn(move || { let _ = child.wait(); });
+                    *last_clipboard().lock().unwrap() = format!("image:{:016x}", image_hash(bytes));
+                    return true;
+                }
+                let _ = child.kill();
+                log(&format!("Image clipboard helper {program} failed while writing; trying GTK clipboard"));
+            }
+            Err(error) => log(&format!("Could not start image clipboard helper {program}: {error}; trying GTK clipboard")),
+        }
+    }
+
+    if gtk_clipboard_write_png(bytes) {
+        *last_clipboard().lock().unwrap() = format!("image:{:016x}", image_hash(bytes));
+        true
+    } else {
+        log("Image clipboard copy failed: both the native helper and GTK clipboard were unavailable");
+        false
+    }
 }
 
 fn ocr_start() {
@@ -2666,9 +2745,14 @@ fn settings_set(key: String, value: Value) { settings_apply(&key, &value); }
 fn action(name: String) {
     match name.as_str() {
         "screenshot" => {
-            match capture_fullscreen() {
-                Ok(png) if clipboard_write_png(&png) => emit("clip", json!({ "kind": "image" })),
-                Ok(_) => emit("helper", json!({ "t": "capture-error", "message": "Could not put the screenshot on the clipboard. Check wl-clipboard or xclip." })),
+            match capture_selection() {
+                Ok(png) if clipboard_write_png(&png) => {
+                    // The writer updates LAST_CLIPBOARD to avoid a duplicate watcher event,
+                    // so add the screenshot to history right here instead of waiting for polling.
+                    if setting_flag("clipHistory") { add_clip_image(png); }
+                    emit("clip", json!({ "kind": "image" }));
+                }
+                Ok(_) => emit("helper", json!({ "t": "capture-error", "message": "Could not copy the selected screenshot. GTK clipboard and the desktop clipboard helper both failed." })),
                 Err(why) => {
                     log(&format!("Screenshot failed: {why}"));
                     emit("helper", json!({ "t": "capture-error", "message": why }));
@@ -3310,6 +3394,7 @@ fn main() {
             vault_list, vault_generate, vault_save, vault_edit, fg_context, vault_copy, copy_secret, vault_reveal, vault_remove, debug_out
         ])
         .setup(|app| {
+            let _ = GTK_MAIN_THREAD_ID.set(thread::current().id());
             let _ = APP.set(app.handle().clone());
             if !is_wayland() { register_x11_hotkeys(app); }
 
