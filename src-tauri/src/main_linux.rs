@@ -52,6 +52,23 @@ static VIZ_ACTIVE: AtomicBool = AtomicBool::new(false);
 static VIZ_STARTED: AtomicBool = AtomicBool::new(false);
 static PREVIOUS_X11_WINDOW: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
+const UPDATE_KEY: [u8; 32] = [
+    63, 0, 60, 214, 100, 167, 237, 223, 180, 217, 239, 181, 141, 177, 76, 130,
+    3, 62, 67, 79, 23, 72, 155, 50, 58, 132, 111, 212, 124, 162, 222, 128,
+];
+
+#[derive(Clone)]
+struct LinuxUpdate {
+    version: String,
+    package: PathBuf,
+}
+
+static UPDATE_READY: OnceLock<Mutex<Option<LinuxUpdate>>> = OnceLock::new();
+
+fn update_ready() -> &'static Mutex<Option<LinuxUpdate>> {
+    UPDATE_READY.get_or_init(|| Mutex::new(None))
+}
+
 fn previous_x11_window() -> &'static Mutex<Option<String>> {
     PREVIOUS_X11_WINDOW.get_or_init(|| Mutex::new(None))
 }
@@ -2466,11 +2483,223 @@ fn open_url(url: String) {
     }
 }
 
-#[tauri::command]
-fn update_check() -> String { "manual".into() }
+// ---------------------------------------------------------------- signed Linux package updates
+fn update_repository() -> String {
+    let repo = option_env!("PEEKY_UPDATE_REPOSITORY").unwrap_or("raminturne/peeky");
+    let valid = repo.split_once('/').is_some_and(|(owner, project)| {
+        !owner.is_empty() && !project.is_empty()
+            && owner.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+            && project.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+    });
+    if valid { repo.to_string() } else { "raminturne/peeky".to_string() }
+}
 
-#[tauri::command]
-fn update_install() -> bool { false }
+fn update_dir() -> PathBuf {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".cache"));
+    let dir = base.join("peeky").join("updates");
+    let _ = fs::create_dir_all(&dir);
+    dir
+}
+
+fn safe_update_asset(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 180
+        && name.ends_with(".deb")
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || "._+-".contains(c))
+}
+
+fn download_update_asset(name: &str, max_bytes: u64) -> Option<PathBuf> {
+    let path = update_dir().join(name);
+    let _ = fs::remove_file(&path);
+    let url = format!(
+        "https://github.com/{}/releases/latest/download/{}",
+        update_repository(), name
+    );
+    let limit = max_bytes.to_string();
+    let status = Command::new("curl")
+        .args([
+            "--fail", "--location", "--silent", "--show-error",
+            "--connect-timeout", "12", "--max-time", "180",
+            "--retry", "2", "--max-filesize", &limit,
+            "--output",
+        ])
+        .arg(&path)
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()?;
+    if !status.success() { return None; }
+    let size = fs::metadata(&path).ok()?.len();
+    (size > 0 && size <= max_bytes).then_some(path)
+}
+
+fn update_version_parts(version: &str) -> Vec<u64> {
+    version.trim_start_matches('v')
+        .split('.')
+        .map(|part| part.split(['-', '+']).next().unwrap_or("0").parse::<u64>().unwrap_or(0))
+        .collect()
+}
+
+fn update_is_newer(candidate: &str, current: &str) -> bool {
+    update_version_parts(candidate) > update_version_parts(current)
+}
+
+fn verify_update_package(package: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(package) else { return false; };
+    if metadata.len() == 0 || metadata.len() > 256 * 1024 * 1024 { return false; }
+
+    let signature_path = PathBuf::from(format!("{}.sig", package.to_string_lossy()));
+    let (Ok(data), Ok(signature_text)) = (fs::read(package), fs::read_to_string(signature_path)) else {
+        return false;
+    };
+    let Ok(signature_bytes) = BASE64.decode(signature_text.trim()) else { return false; };
+    let (Ok(public_key), Ok(signature)) = (
+        ed25519_compact::PublicKey::from_slice(&UPDATE_KEY),
+        ed25519_compact::Signature::from_slice(&signature_bytes),
+    ) else {
+        return false;
+    };
+    public_key.verify(&data, &signature).is_ok()
+}
+
+/// Returns "none", "ready <version>", or "failed: <reason>".
+/// The manifest selects a filename only; trust comes from verifying the package signature.
+fn linux_update_check() -> String {
+    if let Some(update) = update_ready().lock().unwrap().as_ref() {
+        return format!("ready {}", update.version);
+    }
+    if !command_exists("curl") || !command_exists("dpkg-deb") {
+        return "failed: install curl and dpkg-deb to check for updates".into();
+    }
+
+    let Some(manifest_path) = download_update_asset("latest-linux.json", 64 * 1024) else {
+        return "failed: could not download the Linux update manifest".into();
+    };
+    let manifest = fs::read_to_string(&manifest_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+    let Some(manifest) = manifest else {
+        return "failed: the Linux update manifest is invalid".into();
+    };
+    let Some(filename) = manifest["file"].as_str().filter(|name| safe_update_asset(name)) else {
+        return "failed: the Linux update manifest contains an invalid package name".into();
+    };
+
+    let Some(package) = download_update_asset(filename, 256 * 1024 * 1024) else {
+        return "failed: the Linux package download did not finish".into();
+    };
+    let signature_name = format!("{filename}.sig");
+    let Some(signature) = download_update_asset(&signature_name, 16 * 1024) else {
+        let _ = fs::remove_file(&package);
+        return "failed: the package signature could not be downloaded".into();
+    };
+
+    if !verify_update_package(&package) {
+        let _ = fs::remove_file(&package);
+        let _ = fs::remove_file(&signature);
+        log("Linux update rejected: package signature verification failed");
+        return "failed: the package signature is not valid".into();
+    }
+
+    let package_version = output("dpkg-deb", &["-f", package.to_string_lossy().as_ref(), "Version"])
+        .unwrap_or_default();
+    let manifest_version = manifest["version"].as_str().unwrap_or("").trim();
+    if package_version.is_empty() || package_version != manifest_version {
+        let _ = fs::remove_file(&package);
+        let _ = fs::remove_file(&signature);
+        return "failed: package version does not match the release manifest".into();
+    }
+    if !update_is_newer(&package_version, env!("CARGO_PKG_VERSION")) {
+        let _ = fs::remove_file(&package);
+        let _ = fs::remove_file(&signature);
+        return "none".into();
+    }
+
+    *update_ready().lock().unwrap() = Some(LinuxUpdate {
+        version: package_version.clone(),
+        package,
+    });
+    emit("helper", json!({
+        "t": "update",
+        "version": package_version,
+        "body": "An update is ready. Click here to install it and approve the administrator prompt."
+    }));
+    format!("ready {package_version}")
+}
+
+/// Installation is always user initiated. pkexec displays the desktop's administrator
+/// confirmation; never run dpkg silently from the periodic update checker.
+fn linux_update_install() -> bool {
+    let Some(update) = update_ready().lock().unwrap().clone() else { return false; };
+    if !verify_update_package(&update.package) {
+        log("Linux update rejected at install time: package signature verification failed");
+        return false;
+    }
+    if !command_exists("pkexec") || !Path::new("/usr/bin/dpkg").exists() {
+        log("Linux update cannot start: pkexec or /usr/bin/dpkg is missing");
+        return false;
+    }
+
+    log(&format!("Starting administrator-approved Linux update {}", update.version));
+    let status = Command::new("pkexec")
+        .arg("/usr/bin/dpkg")
+        .arg("--install")
+        .arg(&update.package)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    match status {
+        Ok(status) if status.success() => {
+            if let Some(app) = APP.get() {
+                app.request_restart();
+                true
+            } else {
+                false
+            }
+        }
+        Ok(status) => {
+            log(&format!("Linux package installation was not completed (exit status {})", status));
+            false
+        }
+        Err(error) => {
+            log(&format!("Could not start administrator-approved Linux package installation: {error}"));
+            false
+        }
+    }
+}
+
+fn update_background_start() {
+    thread::spawn(|| {
+        thread::sleep(Duration::from_secs(45));
+        let mut next_check = 0u64;
+        loop {
+            if setting_flag("autoUpdate") && now_ms() >= next_check {
+                let result = linux_update_check();
+                let delay = if result.starts_with("failed") {
+                    Duration::from_secs(30 * 60)
+                } else {
+                    Duration::from_secs(6 * 60 * 60)
+                };
+                next_check = now_ms().saturating_add(delay.as_millis() as u64);
+                if result.starts_with("failed") {
+                    log(&format!("Automatic Linux update check: {result}"));
+                }
+            }
+            thread::sleep(Duration::from_secs(20));
+        }
+    });
+}
+
+#[tauri::command(async)]
+fn update_check() -> String { linux_update_check() }
+
+#[tauri::command(async)]
+fn update_install() -> bool { linux_update_install() }
 
 #[tauri::command]
 fn speedo_cmd(_cmd: String, _id: Option<String>, _on: Option<bool>) -> Value {
@@ -2873,6 +3102,7 @@ fn main() {
             interaction_watchdog_start();
             poll_start();
             visualizer_start();
+            update_background_start();
             settings_broadcast();
             emit("notes", notes_payload(&notes().lock().unwrap()));
             emit("vault", vault_payload());

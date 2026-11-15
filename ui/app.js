@@ -370,7 +370,7 @@ side.addEventListener('click', () => {
   if (n) {
     if (n.action === 'dnd') window.qazi.action('dnd');
     else if (n.action === 'download') window.qazi.openDownload(n.path);
-    else if (n.action === 'update') window.qazi.updateInstall();
+    else if (n.action === 'update') installUpdate();
     else if (n.action === 'whatsnew') window.qazi.openUrl('https://github.com/raminturne/peeky/releases/tag/v' + n.version);
     else if (n.action === 'note') { st.holdUntil = Date.now() + 5000; setStack(true, 'notes'); }
     else if (n.action === 'tour') { st.holdUntil = Date.now() + 9000; st.revealUntil = Date.now() + 9000; setStack(true, 'tour'); }
@@ -414,7 +414,7 @@ views.notif.addEventListener('click', () => {
   if (n) {
     if (n.action === 'dnd') window.qazi.action('dnd');
     else if (n.action === 'download') window.qazi.openDownload(n.path);
-    else if (n.action === 'update') window.qazi.updateInstall();
+    else if (n.action === 'update') installUpdate();
     else if (n.action === 'whatsnew') window.qazi.openUrl('https://github.com/raminturne/peeky/releases/tag/v' + n.version);
     else if (n.action === 'note') { st.holdUntil = Date.now() + 5000; setStack(true, 'notes'); }
     else if (n.action === 'tour') { st.holdUntil = Date.now() + 9000; st.revealUntil = Date.now() + 9000; setStack(true, 'tour'); }
@@ -423,6 +423,12 @@ views.notif.addEventListener('click', () => {
   endNotif();
 });
 
+async function installUpdate() {
+  const ok = await window.qazi.updateInstall();
+  if (!ok) {
+    showHud('alert', 'Update not installed', 'Check the administrator prompt and system package manager', 4200, 'faded');
+  }
+}
 // ------------------------------------------------------------ notification stack
 function updateBadge() {       // the count lives on the bell inside the menu only — nothing is added next to the clock
   badge.textContent = st.unseen > 9 ? '9+' : st.unseen;
@@ -787,7 +793,7 @@ window.qazi.onHelper((m) => {
   }
   else if (m.t === 'update') {
     st.update = m.version; gearBadge.classList.add('on');
-    showNotif({ app: 'Update', title: 'Version ' + m.version + ' is ready', body: 'click to install now (it also installs by itself when you step away)', action: 'update', long: true });
+    showNotif({ app: 'Update', title: 'Version ' + m.version + ' is ready', body: m.body || 'click to install now (it also installs by itself when you step away)', action: 'update', long: true });
     if (st.stackOpen && st.stackKind === 'settings') renderStack();
   }
   else if (m.t === 'updated') showNotif({ app: 'Update', title: 'Peeky was updated to ' + m.version, body: "click to see what's new", action: 'whatsnew', version: m.version, long: true });
@@ -1888,10 +1894,16 @@ function renderSettings() {
     const l = document.createElement('span'); l.className = 'lbl';
     const b = document.createElement('b'); b.textContent = 'Version ' + st.update + ' is ready';
     const d = document.createElement('span'); d.className = 'dim';
-    d.textContent = s.autoUpdate !== false ? 'Installs by itself when you step away' : 'Takes a few seconds, then Peeky is back';
+    d.textContent = s.platform === 'linux'
+      ? 'Requires administrator approval; Peeky restarts after installation'
+      : (s.autoUpdate !== false ? 'Installs by itself when you step away' : 'Takes a few seconds, then Peeky is back');
     l.append(b, d);
     const go = document.createElement('button'); go.className = 'go solid'; go.textContent = 'Install now';
-    go.addEventListener('click', () => { go.textContent = 'Installing…'; window.qazi.updateInstall(); });
+    go.addEventListener('click', async () => {
+      go.textContent = 'Installing…';
+      const ok = await window.qazi.updateInstall();
+      if (!ok) { go.textContent = 'Install failed'; showHud('alert', 'Update not installed', 'Check the administrator prompt and system package manager', 4200, 'faded'); }
+    });
     row.append(ic, l, go);
     stackList.appendChild(row);
   }
@@ -1937,7 +1949,7 @@ function renderSettings() {
   info.textContent = (s.appName || 'Peeky') + ' ' + (s.version || '');
   const up = document.createElement('button'); up.className = 'go'; up.textContent = st.update ? 'Install ' + st.update : 'Check for updates';
   up.addEventListener('click', async () => {
-    if (st.update) { window.qazi.updateInstall(); return; }
+    if (st.update) { installUpdate(); return; }
     up.textContent = 'Checking…';
     const r = await window.qazi.updateCheck();
     if (r.startsWith('ready')) { st.update = r.slice(6); gearBadge.classList.add('on'); renderStack(); return; }
