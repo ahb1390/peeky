@@ -389,13 +389,11 @@ fn clipboard_read_image() -> Option<Vec<u8>> {
         vec![
             ("wl-paste", vec!["--no-newline", "--type", "image/png"]),
             ("wl-paste", vec!["--no-newline", "--type", "image/jpeg"]),
-            ("wl-paste", vec!["--no-newline", "--type", "image/webp"]),
         ]
     } else {
         vec![
             ("xclip", vec!["-selection", "clipboard", "-o", "-t", "image/png"]),
             ("xclip", vec!["-selection", "clipboard", "-o", "-t", "image/jpeg"]),
-            ("xclip", vec!["-selection", "clipboard", "-o", "-t", "image/webp"]),
         ]
     };
 

@@ -45,7 +45,7 @@ cairo-rs = "0.18"
 gtk-layer-shell = { version = "0.8.2", features = ["v0_5", "v0_6"] }
 gdkx11 = "0.18.2"
 x11-dl = "2.21"
-image = { version = "0.25", default-features = false, features = ["png", "bmp", "jpeg", "webp"] }
+image = { version = "0.25", default-features = false, features = ["png", "bmp", "jpeg"] }
 
 [features]
 default = ["custom-protocol"]
