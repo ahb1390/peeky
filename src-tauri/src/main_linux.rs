@@ -431,6 +431,63 @@ fn clipboard_write(text: &str, private: bool) -> bool {
     copied
 }
 
+fn emit_clip_preview(text: &str) {
+    let preview = text.chars().take(400).collect::<String>()
+        .split_whitespace().collect::<Vec<_>>().join(" ");
+    emit("clip", json!({ "kind": "text", "text": text, "preview": preview }));
+}
+
+fn clip_payload() -> Value {
+    Value::Array(clips().lock().unwrap().iter().map(|clip| {
+        if clip.image.is_some() {
+            json!({
+                "id": clip.id, "kind": "image", "preview": clip.preview,
+                "len": 0, "pinned": clip.pinned, "thumb": clip.thumb
+            })
+        } else {
+            let preview = clip.text.chars().take(400).collect::<String>()
+                .split_whitespace().collect::<Vec<_>>().join(" ");
+            json!({
+                "id": clip.id, "kind": "text", "preview": preview,
+                "len": clip.text.chars().count(), "pinned": clip.pinned
+            })
+        }
+    }).collect())
+}
+
+fn save_clips() {
+    let mut pinned: Vec<ClipEntry> = clips().lock().unwrap().iter()
+        .filter(|clip| clip.pinned).cloned().collect();
+    let dir = clip_image_dir();
+    let mut keep = HashSet::new();
+
+    for clip in &mut pinned {
+        if let (Some(name), Some(bytes)) = (clip.image.as_deref(), clip.image_bytes.as_deref()) {
+            if let Some(path) = clip_image_path(name) {
+                if !path.exists() {
+                    let _ = write_atomic(&path, bytes);
+                }
+                keep.insert(name.to_string());
+            }
+        } else if let Some(name) = clip.image.as_deref() {
+            if clip_image_path(name).is_some_and(|path| path.exists()) {
+                keep.insert(name.to_string());
+            }
+        }
+        clip.image_bytes = None;
+    }
+
+    write_json(&data_dir().join("clips.json"), &pinned);
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !keep.contains(&name) {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
 fn clip_image_dir() -> PathBuf {
     let dir = data_dir().join("clips");
     let _ = fs::create_dir_all(&dir);
