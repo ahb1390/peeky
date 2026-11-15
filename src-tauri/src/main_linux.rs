@@ -1675,10 +1675,9 @@ fn x11_pointer_watch() {
             let y = (root_y - position.y) as f64 / scale;
             let near = x > -80.0 && x < WIN_W + 80.0 && y > -80.0 && y < WIN_H + 80.0;
 
+            let pointer_moved = (x - last_x).abs() > 0.1 || (y - last_y).abs() > 0.1;
             if (near || was_near)
-                && (x - last_x).abs() > 0.1
-                    || (near || was_near) && (y - last_y).abs() > 0.1
-                    || (near || was_near) && last_emit.elapsed() >= Duration::from_millis(32)
+                && (pointer_moved || last_emit.elapsed() >= Duration::from_millis(32))
             {
                 emit("cursor", json!({ "x": (x * 10.0).round() / 10.0, "y": (y * 10.0).round() / 10.0 }));
                 last_emit = std::time::Instant::now();
@@ -1705,8 +1704,6 @@ fn x11_pointer_watch() {
             }
             last_down = left_button_down;
         }
-
-        (xlib.XCloseDisplay)(display);
     });
 }
 
