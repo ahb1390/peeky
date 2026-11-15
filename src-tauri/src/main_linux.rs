@@ -3,7 +3,7 @@
 use std::{
     collections::HashSet,
     fs,
-    io::{Read, Write},
+    io::{Cursor, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     ptr,
@@ -12,6 +12,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use image::ImageFormat;
 use gtk::glib::object::Cast;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -267,9 +269,18 @@ fn update_hotkeys(on: bool) {
 #[derive(Clone, Serialize, Deserialize)]
 struct ClipEntry {
     id: u64,
+    #[serde(default)]
     text: String,
     pinned: bool,
     at: u64,
+    #[serde(default)]
+    image: Option<String>,
+    #[serde(default)]
+    preview: String,
+    #[serde(default)]
+    thumb: String,
+    #[serde(skip)]
+    image_bytes: Option<Vec<u8>>,
 }
 
 fn clips() -> &'static Mutex<Vec<ClipEntry>> {
@@ -311,16 +322,181 @@ fn clipboard_write(text: &str, private: bool) -> bool {
     true
 }
 
+fn clip_image_dir() -> PathBuf {
+    let dir = data_dir().join("clips");
+    let _ = fs::create_dir_all(&dir);
+    dir
+}
+
+fn clip_image_path(name: &str) -> Option<PathBuf> {
+    let path = Path::new(name);
+    if path.components().count() != 1 || path.file_name()?.to_str()? != name {
+        return None;
+    }
+    Some(clip_image_dir().join(path))
+}
+
+fn image_hash(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn build_image_clip(
+    id: u64,
+    pinned: bool,
+    at: u64,
+    bytes: Vec<u8>,
+    stored_name: Option<String>,
+) -> Option<ClipEntry> {
+    if bytes.is_empty() || bytes.len() > 20 * 1024 * 1024 {
+        return None;
+    }
+    let decoded = image::load_from_memory(&bytes).ok()?;
+    let (width, height) = (decoded.width(), decoded.height());
+    if width == 0 || height == 0 || (width as u64) * (height as u64) > 40_000_000 {
+        return None;
+    }
+
+    let mut png_cursor = Cursor::new(Vec::new());
+    decoded.write_to(&mut png_cursor, ImageFormat::Png).ok()?;
+    let png = png_cursor.into_inner();
+
+    let thumbnail = decoded.thumbnail(200, 60).to_rgba8();
+    let mut thumb_cursor = Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(thumbnail)
+        .write_to(&mut thumb_cursor, ImageFormat::Png)
+        .ok()?;
+
+    let filename = stored_name.unwrap_or_else(|| format!("{:016x}.png", image_hash(&png)));
+    Some(ClipEntry {
+        id,
+        text: String::new(),
+        pinned,
+        at,
+        image: Some(filename),
+        preview: format!("{width} × {height}"),
+        thumb: BASE64.encode(thumb_cursor.into_inner()),
+        image_bytes: Some(png),
+    })
+}
+
+fn clipboard_read_image() -> Option<Vec<u8>> {
+    let candidates: Vec<(&str, Vec<&str>)> = if is_wayland() {
+        vec![
+            ("wl-paste", vec!["--no-newline", "--type", "image/png"]),
+            ("wl-paste", vec!["--no-newline", "--type", "image/jpeg"]),
+            ("wl-paste", vec!["--no-newline", "--type", "image/webp"]),
+        ]
+    } else {
+        vec![
+            ("xclip", vec!["-selection", "clipboard", "-o", "-t", "image/png"]),
+            ("xclip", vec!["-selection", "clipboard", "-o", "-t", "image/jpeg"]),
+            ("xclip", vec!["-selection", "clipboard", "-o", "-t", "image/webp"]),
+        ]
+    };
+
+    for (program, args) in candidates {
+        let result = Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if result.status.success() && !result.stdout.is_empty() {
+            return Some(result.stdout);
+        }
+    }
+    None
+}
+
+fn clipboard_read_file_urls() -> Option<String> {
+    let (program, args): (&str, &[&str]) = if is_wayland() {
+        ("wl-paste", &["--no-newline", "--type", "text/uri-list"])
+    } else {
+        ("xclip", &["-selection", "clipboard", "-o", "-t", "text/uri-list"])
+    };
+    let value = output(program, args)?;
+    let urls = value.lines().filter(|line| {
+        let line = line.trim();
+        !line.is_empty() && !line.starts_with('#')
+    }).collect::<Vec<_>>();
+    if urls.is_empty() { None } else { Some(urls.join("\n")) }
+}
+
+fn emit_clip_preview(text: &str) {
+    let preview = text.chars().take(400).collect::<String>()
+        .split_whitespace().collect::<Vec<_>>().join(" ");
+    emit("clip", json!({ "kind": "text", "text": text, "preview": preview }));
+}
+
 fn clip_payload() -> Value {
-    Value::Array(clips().lock().unwrap().iter().map(|c| {
-        let preview = c.text.chars().take(400).collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ");
-        json!({ "id": c.id, "kind": "text", "preview": preview, "len": c.text.chars().count(), "pinned": c.pinned })
+    Value::Array(clips().lock().unwrap().iter().map(|clip| {
+        if clip.image.is_some() {
+            json!({
+                "id": clip.id, "kind": "image", "preview": clip.preview,
+                "len": 0, "pinned": clip.pinned, "thumb": clip.thumb
+            })
+        } else {
+            let preview = clip.text.chars().take(400).collect::<String>()
+                .split_whitespace().collect::<Vec<_>>().join(" ");
+            json!({
+                "id": clip.id, "kind": "text", "preview": preview,
+                "len": clip.text.chars().count(), "pinned": clip.pinned
+            })
+        }
     }).collect())
 }
 
 fn save_clips() {
-    let pinned: Vec<ClipEntry> = clips().lock().unwrap().iter().filter(|c| c.pinned).cloned().collect();
+    let mut pinned: Vec<ClipEntry> = clips().lock().unwrap().iter()
+        .filter(|clip| clip.pinned).cloned().collect();
+    let dir = clip_image_dir();
+    let mut keep = HashSet::new();
+
+    for clip in &mut pinned {
+        if let (Some(name), Some(bytes)) = (clip.image.as_deref(), clip.image_bytes.as_deref()) {
+            if let Some(path) = clip_image_path(name) {
+                if !path.exists() {
+                    let _ = write_atomic(&path, bytes);
+                }
+                keep.insert(name.to_string());
+            }
+        } else if let Some(name) = clip.image.as_deref() {
+            if clip_image_path(name).is_some_and(|path| path.exists()) {
+                keep.insert(name.to_string());
+            }
+        }
+        clip.image_bytes = None;
+    }
+
     write_json(&data_dir().join("clips.json"), &pinned);
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !keep.contains(&name) {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+fn enforce_clip_limits(list: &mut Vec<ClipEntry>) {
+    list.sort_by(|a, b| b.pinned.cmp(&a.pinned).then(b.at.cmp(&a.at)));
+    let mut loose = 0usize;
+    let mut loose_images = 0usize;
+    list.retain(|clip| {
+        if clip.pinned { return true; }
+        loose += 1;
+        if clip.image.is_some() {
+            loose_images += 1;
+            if loose_images > 10 { return false; }
+        }
+        loose <= 30
+    });
 }
 
 fn add_clip(text: String) {
@@ -328,35 +504,72 @@ fn add_clip(text: String) {
     if text.trim().is_empty() || text.chars().count() > 100_000 { return; }
     {
         let mut list = clips().lock().unwrap();
-        if let Some(found) = list.iter_mut().find(|c| c.text == text) {
+        if let Some(found) = list.iter_mut().find(|clip| clip.image.is_none() && clip.text == text) {
             found.at = now_ms();
         } else {
-            let id = list.iter().map(|c| c.id).max().unwrap_or(0) + 1;
-            list.push(ClipEntry { id, text: text.clone(), pinned: false, at: now_ms() });
+            let id = list.iter().map(|clip| clip.id).max().unwrap_or(0) + 1;
+            list.push(ClipEntry {
+                id, text, pinned: false, at: now_ms(),
+                image: None, preview: String::new(), thumb: String::new(), image_bytes: None,
+            });
         }
-        list.sort_by(|a, b| b.pinned.cmp(&a.pinned).then(b.at.cmp(&a.at)));
-        let mut loose = 0usize;
-        list.retain(|c| c.pinned || { loose += 1; loose <= 30 });
+        enforce_clip_limits(&mut list);
     }
     save_clips();
     emit("clips", clip_payload());
-    let preview = text.chars().take(400).collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ");
-    emit("clip", json!({ "kind": "text", "text": text, "preview": preview }));
+}
+
+fn add_clip_image(bytes: Vec<u8>) {
+    let next_id = clips().lock().unwrap().iter().map(|clip| clip.id).max().unwrap_or(0) + 1;
+    let Some(entry) = build_image_clip(next_id, false, now_ms(), bytes, None) else { return; };
+    {
+        let mut list = clips().lock().unwrap();
+        if let Some(filename) = entry.image.as_deref() {
+            if let Some(found) = list.iter_mut().find(|clip| clip.image.as_deref() == Some(filename)) {
+                found.at = now_ms();
+                found.image_bytes = entry.image_bytes;
+                found.preview = entry.preview;
+                found.thumb = entry.thumb;
+            } else {
+                list.push(entry);
+            }
+        }
+        enforce_clip_limits(&mut list);
+    }
+    save_clips();
+    emit("clips", clip_payload());
 }
 
 fn clips_load() {
     if let Ok(raw) = fs::read_to_string(data_dir().join("clips.json")) {
-        if let Ok(list) = serde_json::from_str::<Vec<ClipEntry>>(&raw) {
-            *clips().lock().unwrap() = list;
+        if let Ok(saved) = serde_json::from_str::<Vec<ClipEntry>>(&raw) {
+            let mut loaded = Vec::new();
+            for clip in saved {
+                if let Some(name) = clip.image.as_deref() {
+                    let Some(path) = clip_image_path(name) else { continue; };
+                    let Ok(bytes) = fs::read(path) else { continue; };
+                    if let Some(mut image) = build_image_clip(clip.id, clip.pinned, clip.at, bytes, Some(name.to_string())) {
+                        loaded.push(image);
+                    }
+                } else if !clip.text.is_empty() {
+                    loaded.push(ClipEntry { image: None, image_bytes: None, preview: String::new(), thumb: String::new(), ..clip });
+                }
+            }
+            *clips().lock().unwrap() = loaded;
         }
     }
-    let current = clipboard_read().unwrap_or_default();
-    *last_clipboard().lock().unwrap() = current;
+
+    let current_text = clipboard_read().filter(|text| !text.trim().is_empty());
+    let current_image = if current_text.is_none() {
+        clipboard_read_image().map(|bytes| format!("image:{:016x}", image_hash(&bytes)))
+    } else { None };
+    *last_clipboard().lock().unwrap() = current_text.or(current_image).unwrap_or_default();
 }
 
 fn copy_text_impl(text: &str) -> bool {
     if !clipboard_write(text, false) { return false; }
     if setting_flag("clipHistory") { add_clip(text.to_string()); }
+    if setting_flag("copyPreview") { emit_clip_preview(text); }
     true
 }
 
@@ -375,15 +588,46 @@ fn copy_secret_impl(text: &str) -> bool {
 fn clipboard_watch() {
     thread::spawn(|| loop {
         thread::sleep(Duration::from_millis(900));
-        let Some(text) = clipboard_read() else { continue; };
-        let mut last = last_clipboard().lock().unwrap();
-        if !text.is_empty() && *last != text {
-            *last = text.clone();
-            drop(last);
-            if setting_flag("clipHistory") { add_clip(text); }
+
+        if let Some(text) = clipboard_read().filter(|text| !text.trim().is_empty()) {
+            let changed = {
+                let mut last = last_clipboard().lock().unwrap();
+                if *last == text { false } else { *last = text.clone(); true }
+            };
+            if changed {
+                if setting_flag("clipHistory") { add_clip(text.clone()); }
+                if setting_flag("copyPreview") { emit_clip_preview(&text); }
+            }
+            continue;
+        }
+
+        if let Some(image) = clipboard_read_image() {
+            let signature = format!("image:{:016x}", image_hash(&image));
+            let changed = {
+                let mut last = last_clipboard().lock().unwrap();
+                if *last == signature { false } else { *last = signature; true }
+            };
+            if changed {
+                if setting_flag("clipHistory") { add_clip_image(image); }
+                if setting_flag("copyPreview") { emit("clip", json!({ "kind": "image" })); }
+            }
+            continue;
+        }
+
+        if let Some(files) = clipboard_read_file_urls() {
+            let signature = format!("files:{files}");
+            let changed = {
+                let mut last = last_clipboard().lock().unwrap();
+                if *last == signature { false } else { *last = signature; true }
+            };
+            if changed && setting_flag("copyPreview") {
+                let count = files.lines().count();
+                emit("clip", json!({ "kind": "files", "preview": format!("{count} file(s)") }));
+            }
         }
     });
 }
+
 
 // ---------------------------------------------------------------- notes and Secret Service vault (GNOME Keyring / KWallet via libsecret)
 #[derive(Clone, Serialize, Deserialize)]
@@ -965,6 +1209,7 @@ fn clipboard_write_png(bytes: &[u8]) -> bool {
     let Some(mut stdin) = child.stdin.take() else { let _ = child.kill(); return false; };
     if stdin.write_all(bytes).is_err() { let _ = child.kill(); return false; }
     drop(stdin);
+    *last_clipboard().lock().unwrap() = format!("image:{:016x}", image_hash(bytes));
     thread::spawn(move || { let _ = child.wait(); });
     true
 }
@@ -1496,8 +1741,19 @@ fn clips_get() -> Value { clip_payload() }
 
 #[tauri::command]
 fn clip_copy(id: u64) -> bool {
-    let text = clips().lock().unwrap().iter().find(|c| c.id == id).map(|c| c.text.clone());
-    text.map(|t| copy_text_impl(&t)).unwrap_or(false)
+    let entry = clips().lock().unwrap().iter().find(|clip| clip.id == id).cloned();
+    let Some(entry) = entry else { return false; };
+    if let Some(image_name) = entry.image.as_deref() {
+        let bytes = entry.image_bytes.clone().or_else(|| clip_image_path(image_name).and_then(|path| fs::read(path).ok()));
+        let Some(bytes) = bytes else { return false; };
+        let copied = clipboard_write_png(&bytes);
+        if copied && setting_flag("copyPreview") {
+            emit("clip", json!({ "kind": "image" }));
+        }
+        copied
+    } else {
+        copy_text_impl(&entry.text)
+    }
 }
 
 #[tauri::command]
