@@ -40,6 +40,8 @@ static NOTES: OnceLock<Mutex<Vec<Note>>> = OnceLock::new();
 static VAULT: OnceLock<Mutex<Vec<VaultItem>>> = OnceLock::new();
 static CLIPS: OnceLock<Mutex<Vec<ClipEntry>>> = OnceLock::new();
 static SHELF: OnceLock<Mutex<Vec<ShelfItem>>> = OnceLock::new();
+static SHELF_DRAG_PATHS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+static SHELF_DRAG_HOOKED: AtomicBool = AtomicBool::new(false);
 static LAST_CLIPBOARD: OnceLock<Mutex<String>> = OnceLock::new();
 static X11_POINTER_ACTIVE: AtomicBool = AtomicBool::new(false);
 static X11_LIB: OnceLock<x11_dl::xlib::Xlib> = OnceLock::new();
@@ -1135,9 +1137,92 @@ fn shelf_reveal_impl(path: &str) {
     open_path(target.to_string_lossy().as_ref());
 }
 
-fn shelf_drag_impl(_paths: Vec<String>) {
-    // GTK/WebKit file drag-out is not exposed by the current Tauri 2 window API. Files remain
-    // available through the shelf's reveal/open actions instead of faking a drag operation.
+fn shelf_drag_paths() -> &'static Mutex<Vec<String>> {
+    SHELF_DRAG_PATHS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn path_file_uri(path: &str) -> String {
+    let mut uri = String::from("file://");
+    for byte in path.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'_' | b'.' | b'~' => uri.push(*byte as char),
+            other => uri.push_str(&format!("%{other:02X}")),
+        }
+    }
+    uri
+}
+
+fn shelf_drag_impl(paths: Vec<String>) {
+    let files: Vec<String> = {
+        let shelf = shelf().lock().unwrap();
+        shelf.iter()
+            .filter(|item| paths.iter().any(|path| path == &item.path))
+            .filter_map(|item| Path::new(&item.path).canonicalize().ok())
+            .filter(|path| path.is_file())
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect()
+    };
+    if files.is_empty() {
+        log("Shelf drag ignored: none of the selected files still exists");
+        return;
+    }
+
+    *shelf_drag_paths().lock().unwrap() = files;
+    emit("shelf-dragging", true);
+
+    let Some(window) = APP.get().and_then(|app| app.get_webview_window("main")) else {
+        shelf_drag_paths().lock().unwrap().clear();
+        emit("shelf-dragging", false);
+        return;
+    };
+
+    let drag_result = window.run_on_main_thread(move || {
+        let Ok(gtk_window) = window.gtk_window() else {
+            log("Shelf drag failed: could not access the native GTK window");
+            shelf_drag_paths().lock().unwrap().clear();
+            emit("shelf-dragging", false);
+            return;
+        };
+
+        // GTK keeps the native drag source and file URI negotiation on the UI thread.
+        // The data is read from the validated shelf paths only when the destination asks.
+        if !SHELF_DRAG_HOOKED.swap(true, Ordering::SeqCst) {
+            gtk_window.connect_drag_data_get(|_, _context, selection, _info, _time| {
+                let uris: Vec<String> = shelf_drag_paths().lock().unwrap()
+                    .iter().map(|path| path_file_uri(path)).collect();
+                let refs: Vec<&str> = uris.iter().map(String::as_str).collect();
+                if !selection.set_uris(&refs) {
+                    log("Shelf drag destination rejected the file URI list");
+                }
+            });
+            gtk_window.connect_drag_end(|_, _context| {
+                shelf_drag_paths().lock().unwrap().clear();
+                emit("shelf-dragging", false);
+            });
+        }
+
+        let targets = gtk::TargetList::new(&[]);
+        targets.add_uri_targets(0);
+        let context = gtk_window.drag_begin_with_coordinates(
+            &targets,
+            gtk::gdk::DragAction::COPY,
+            1,
+            None,
+            -1,
+            -1,
+        );
+        if context.is_none() {
+            shelf_drag_paths().lock().unwrap().clear();
+            emit("shelf-dragging", false);
+            log("GTK could not start the native Shelf file drag");
+        }
+    });
+
+    if let Err(error) = drag_result {
+        shelf_drag_paths().lock().unwrap().clear();
+        emit("shelf-dragging", false);
+        log(&format!("Shelf drag could not reach the GTK main thread: {error}"));
+    }
 }
 
 fn size_label(bytes: u64) -> String {
