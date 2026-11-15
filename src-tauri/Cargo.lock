@@ -2553,6 +2553,7 @@ dependencies = [
  "ed25519-compact",
  "gtk",
  "gtk-layer-shell",
+ "gdkx11",
  "image",
  "serde",
  "serde_json",
@@ -2563,7 +2564,7 @@ dependencies = [
  "webview2-com",
  "windows",
  "windows-core",
- "windows-future",
+ "windows-future", "x11-dl",
 ]
 
 [[package]]
