@@ -420,6 +420,13 @@ fn last_clipboard() -> &'static Mutex<String> {
 }
 
 fn clipboard_read() -> Option<String> {
+    // Cinnamon's GTK clipboard bridge talks to the same desktop-owned selection used by
+    // its screenshot tool. Prefer it there, then use the command-line readers as fallback.
+    if desktop_name().contains("cinnamon") {
+        if let Some(text) = gtk_clipboard_read_text().filter(|text| !text.is_empty()) {
+            return Some(text);
+        }
+    }
     // Do not use the generic output() helper here: it trims whitespace and line endings,
     // which changes the exact text the user copied. Try the common MIME targets in order
     // and preserve the clipboard payload byte-for-byte when it is valid UTF-8.
@@ -508,6 +515,15 @@ fn clipboard_helper_write(program: &str, args: &[&str], bytes: &[u8]) -> bool {
 }
 
 fn clipboard_write(text: &str, private: bool) -> bool {
+    // Do not bypass Cinnamon's desktop clipboard owner: GTK writes directly to the
+    // session's CLIPBOARD selection and also stores it for clipboard managers.
+    if desktop_name().contains("cinnamon") {
+        if gtk_clipboard_write_text(text, !private) {
+            *last_clipboard().lock().unwrap() = text.to_string();
+            return true;
+        }
+        log("Cinnamon GTK text clipboard failed; trying the native clipboard helper");
+    }
     let wayland = is_wayland();
     let program = if wayland {
         command_exists("wl-copy").then_some("wl-copy")
@@ -609,6 +625,13 @@ fn build_image_clip(
 }
 
 fn clipboard_read_image() -> Option<Vec<u8>> {
+    // Cinnamon's own screenshot UI publishes PNG through the desktop clipboard.
+    // Read it through GDK first so the image MIME negotiation matches GTK apps.
+    if desktop_name().contains("cinnamon") {
+        if let Some(image) = gtk_clipboard_read_image() {
+            return Some(image);
+        }
+    }
     let candidates: Vec<(&str, Vec<&str>)> = if is_wayland() {
         vec![
             ("wl-paste", vec!["--no-newline", "--type", "image/png"]),
@@ -1489,6 +1512,57 @@ fn desktop_name() -> String {
         .to_ascii_lowercase()
 }
 
+// Prefer the screenshot application shipped by Cinnamon on Cinnamon desktops.
+ // Its own Save/Copy dialog owns clipboard publication; Peeky only imports the copied
+ // image into its history after the user confirms the copy action.
+fn cinnamon_screenshot_interactive() -> Option<Result<Option<Vec<u8>>, String>> {
+    if !desktop_name().contains("cinnamon") {
+        return None;
+    }
+
+    let program = if command_exists("cinnamon-screenshot") {
+        "cinnamon-screenshot"
+    } else if command_exists("gnome-screenshot") {
+        "gnome-screenshot"
+    } else {
+        log("Cinnamon screenshot UI is unavailable; falling back to the generic capture path");
+        return None;
+    };
+
+    let previous_hash = clipboard_read_image().map(|image| image_hash(&image));
+    log(&format!("Launching Cinnamon-native screenshot UI: {program} --interactive"));
+    let status = match Command::new(program)
+        .arg("--interactive")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(status) => status,
+        Err(error) => return Some(Err(format!("Could not start {program}: {error}"))),
+    };
+
+    if !status.success() {
+        return Some(Err(format!("{program} did not complete successfully")));
+    }
+
+    // The native UI writes the selected image to the desktop clipboard before exiting.
+    // Give the clipboard manager a short moment to expose the image to other apps.
+    for _ in 0..25 {
+        if let Some(image) = clipboard_read_image() {
+            if Some(image_hash(&image)) != previous_hash {
+                log("Cinnamon screenshot UI copied a new image to the desktop clipboard");
+                return Some(Ok(Some(image)));
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    // No changed image means the user cancelled or chose Save rather than Copy.
+    log("Cinnamon screenshot UI closed without placing a new image on the clipboard");
+    Some(Ok(None))
+}
+
 fn capture_selection() -> Result<Vec<u8>, String> {
     let dest = screenshot_path();
     let desktop = desktop_name();
@@ -1572,6 +1646,15 @@ fn capture_fullscreen() -> Result<Vec<u8>, String> {
 }
 
 fn clipboard_write_png(bytes: &[u8]) -> bool {
+    // Cinnamon/GTK applications share the same desktop clipboard selection. Use
+    // GDK first here rather than an external xclip owner, especially for image/png.
+    if desktop_name().contains("cinnamon") {
+        if gtk_clipboard_write_png(bytes) {
+            *last_clipboard().lock().unwrap() = format!("image:{:016x}", image_hash(bytes));
+            return true;
+        }
+        log("Cinnamon GTK image clipboard failed; trying the native clipboard helper");
+    }
     let helper = if is_wayland() {
         command_exists("wl-copy").then_some(("wl-copy", vec!["--type", "image/png"]))
     } else {
@@ -2809,17 +2892,34 @@ fn settings_set(key: String, value: Value) { settings_apply(&key, &value); }
 fn action(name: String) {
     match name.as_str() {
         "screenshot" => {
-            match capture_selection() {
-                Ok(png) if clipboard_write_png(&png) => {
-                    // The writer updates LAST_CLIPBOARD to avoid a duplicate watcher event,
-                    // so add the screenshot to history right here instead of waiting for polling.
-                    if setting_flag("clipHistory") { add_clip_image(png); }
-                    emit("clip", json!({ "kind": "image" }));
+            if let Some(native_result) = cinnamon_screenshot_interactive() {
+                match native_result {
+                    Ok(Some(png)) => {
+                        *last_clipboard().lock().unwrap() = format!("image:{:016x}", image_hash(&png));
+                        if setting_flag("clipHistory") { add_clip_image(png); }
+                        emit("clip", json!({ "kind": "image" }));
+                    }
+                    // The Cinnamon dialog already handles Save and Cancel. Do not launch
+                    // another selector or overwrite the user's clipboard in those cases.
+                    Ok(None) => {}
+                    Err(why) => {
+                        log(&format!("Cinnamon screenshot UI failed: {why}"));
+                        emit("helper", json!({ "t": "capture-error", "message": why }));
+                    }
                 }
-                Ok(_) => emit("helper", json!({ "t": "capture-error", "message": "Could not copy the selected screenshot. GTK clipboard and the desktop clipboard helper both failed." })),
-                Err(why) => {
-                    log(&format!("Screenshot failed: {why}"));
-                    emit("helper", json!({ "t": "capture-error", "message": why }));
+            } else {
+                match capture_selection() {
+                    Ok(png) if clipboard_write_png(&png) => {
+                        // The writer updates LAST_CLIPBOARD to avoid a duplicate watcher event,
+                        // so add the screenshot to history right here instead of waiting for polling.
+                        if setting_flag("clipHistory") { add_clip_image(png); }
+                        emit("clip", json!({ "kind": "image" }));
+                    }
+                    Ok(_) => emit("helper", json!({ "t": "capture-error", "message": "Could not copy the selected screenshot. GTK clipboard and the desktop clipboard helper both failed." })),
+                    Err(why) => {
+                        log(&format!("Screenshot failed: {why}"));
+                        emit("helper", json!({ "t": "capture-error", "message": why }));
+                    }
                 }
             }
         }
