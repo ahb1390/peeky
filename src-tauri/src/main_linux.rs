@@ -2392,8 +2392,7 @@ const KDE_WATCHER_XML: &str = r#"
 fn kde_notification_watcher_start() {
     thread::spawn(|| {
         let context = glib::MainContext::new();
-        let _context_guard = context.push_thread_default();
-
+        let context_result = context.with_thread_default(|| {
         let connection = match gio::bus_get_sync(gio::BusType::Session, None::<&gio::Cancellable>) {
             Ok(connection) => connection,
             Err(error) => {
@@ -2512,6 +2511,10 @@ fn kde_notification_watcher_start() {
             None::<&gio::Cancellable>,
         );
         let _ = connection.unregister_object(registration);
+        });
+        if let Err(error) = context_result {
+            log(&format!("Could not acquire the KDE notification main context: {error}"));
+        }
     });
 }
 
