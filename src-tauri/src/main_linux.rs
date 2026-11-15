@@ -968,7 +968,12 @@ fn x11_cover_state(last_external: &mut Option<String>) -> Option<(bool, bool)> {
         *last_external = None;
         return Some((false, false));
     }
-    let (x, y, width, height) = x11_window_geometry(&target)?;
+    let Some((x, y, width, height)) = x11_window_geometry(&target) else {
+        // The previously focused application may have been closed while Peeky had focus.
+        // Do not leave a stale "covered" state hiding the island.
+        *last_external = None;
+        return Some((false, false));
+    };
     if width <= 0 || height <= 0 { return Some((false, false)); }
 
     let Some(window) = APP.get().and_then(|app| app.get_webview_window("main")) else { return None; };
@@ -980,17 +985,26 @@ fn x11_cover_state(last_external: &mut Option<String>) -> Option<(bool, bool)> {
 
     let right = x.saturating_add(width);
     let bottom = y.saturating_add(height);
-    let covered = x <= center_x && center_x < right && y <= center_y && center_y < bottom;
+    // X11 geometry describes the client surface; a decorated application's title bar can
+    // sit above it. Include a small top frame allowance so maximized browsers still count
+    // as covering the pill and its top-edge controls.
+    let decorated_top = y.saturating_sub(56);
+    let covered = x <= center_x
+        && center_x < right
+        && decorated_top <= center_y
+        && center_y < bottom;
 
     let monitors = window.available_monitors().ok()?;
-    let monitor = monitors.into_iter().find(|monitor| {
+    let Some(monitor) = monitors.into_iter().find(|monitor| {
         let p = monitor.position();
         let s = monitor.size();
         center_x >= p.x
             && center_x < p.x + s.width as i32
             && center_y >= p.y
             && center_y < p.y + s.height as i32
-    })?;
+    }) else {
+        return Some((covered, false));
+    };
     let monitor_position = monitor.position();
     let monitor_size = monitor.size();
     let full = x <= monitor_position.x
