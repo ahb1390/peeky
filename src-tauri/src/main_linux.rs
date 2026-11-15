@@ -1,7 +1,7 @@
 // Native Linux backend. X11 and Wayland use the same GTK/WebKit runtime; compositor
 // policy controls placement and global-input features on Wayland.
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     fs,
     io::{Cursor, Read, Write},
     os::fd::AsRawFd,
@@ -1430,6 +1430,137 @@ fn toggle_mute_value() {
     }
 }
 
+// ---------------------------------------------------------------- Bluetooth and privacy-sensor activity
+fn bluetooth_connected_devices() -> Option<BTreeMap<String, String>> {
+    if !command_exists("bluetoothctl") { return None; }
+    let raw = output("bluetoothctl", &["devices", "Connected"])?;
+    let mut devices = BTreeMap::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("Device ") else { continue; };
+        let mut fields = rest.splitn(2, char::is_whitespace);
+        let Some(address) = fields.next() else { continue; };
+        let name = fields.next().unwrap_or("").trim();
+        if address.matches(':').count() == 5 && !name.is_empty() {
+            devices.insert(address.to_ascii_uppercase(), name.to_string());
+        }
+    }
+    Some(devices)
+}
+
+fn parse_pactl_microphone_users() -> Vec<String> {
+    let sources = output("pactl", &["list", "short", "sources"]).unwrap_or_default();
+    let monitor_sources: HashSet<String> = sources.lines().filter_map(|line| {
+        let mut fields = line.split_whitespace();
+        let id = fields.next()?;
+        let name = fields.next().unwrap_or("").to_ascii_lowercase();
+        (name.contains("monitor") || name.ends_with(".mon")).then(|| id.to_string())
+    }).collect();
+
+    let Some(raw) = output("pactl", &["list", "source-outputs"]) else { return Vec::new(); };
+    let mut found = Vec::new();
+    let (mut source, mut app) = (None::<String>, None::<String>);
+    let flush = |source: &Option<String>, app: &Option<String>, found: &mut Vec<String>| {
+        if source.as_ref().is_some_and(|id| !monitor_sources.contains(id)) {
+            if let Some(name) = app.as_ref().filter(|name| !name.trim().is_empty()) {
+                if !found.iter().any(|old| old == name) { found.push(name.clone()); }
+            }
+        }
+    };
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("Source Output #") {
+            flush(&source, &app, &mut found);
+            source = None;
+            app = None;
+        } else if let Some(value) = trimmed.strip_prefix("Source:") {
+            source = Some(value.trim().to_string());
+        } else if app.is_none() && (trimmed.starts_with("application.name =") || trimmed.starts_with("application.process.binary =")) {
+            if let Some((_, value)) = trimmed.split_once('=') {
+                let value = value.trim().trim_matches('"');
+                if !value.is_empty() { app = Some(value.to_string()); }
+            }
+        }
+    }
+    flush(&source, &app, &mut found);
+    found.sort();
+    found
+}
+
+fn pipewire_capture_users() -> Option<(Vec<String>, Vec<String>)> {
+    let raw = output("pw-dump", &[])?;
+    let json: Value = serde_json::from_str(&raw).ok()?;
+    let nodes = json.as_array()?;
+    let mut mic = Vec::new();
+    let mut cam = Vec::new();
+    for node in nodes {
+        let info = &node["info"];
+        if info["state"].as_str() != Some("running") { continue; }
+        let props = &info["props"];
+        let class = props["media.class"].as_str().unwrap_or("");
+        if !class.starts_with("Stream/Input/") { continue; }
+        let name = props["application.name"].as_str()
+            .or_else(|| props["application.process.binary"].as_str())
+            .or_else(|| props["node.description"].as_str())
+            .unwrap_or("Unknown app").trim();
+        if name.is_empty() { continue; }
+        let target = if class.contains("Video") { &mut cam } else if class.contains("Audio") { &mut mic } else { continue; };
+        if !target.iter().any(|old| old == name) { target.push(name.to_string()); }
+    }
+    mic.sort();
+    cam.sort();
+    Some((mic, cam))
+}
+
+fn proc_capture_users() -> (Vec<String>, Vec<String>) {
+    let mut mic = Vec::new();
+    let mut cam = Vec::new();
+    let Ok(processes) = fs::read_dir("/proc") else { return (mic, cam); };
+    for process in processes.flatten() {
+        let pid = process.file_name().to_string_lossy().parse::<u32>();
+        let Ok(pid) = pid else { continue; };
+        if pid == std::process::id() { continue; }
+        let comm = fs::read_to_string(process.path().join("comm")).unwrap_or_default();
+        let name = comm.trim();
+        if name.is_empty() || name == "pipewire" || name == "wireplumber" { continue; }
+        let Ok(fds) = fs::read_dir(process.path().join("fd")) else { continue; };
+        let mut has_mic = false;
+        let mut has_cam = false;
+        for fd in fds.flatten() {
+            let Ok(target) = fs::read_link(fd.path()) else { continue; };
+            let path = target.to_string_lossy();
+            if path.starts_with("/dev/video") { has_cam = true; }
+            if path.starts_with("/dev/snd/pcm") && path.ends_with('c') { has_mic = true; }
+            if has_cam && has_mic { break; }
+        }
+        if has_mic && !mic.iter().any(|old| old == name) { mic.push(name.to_string()); }
+        if has_cam && !cam.iter().any(|old| old == name) { cam.push(name.to_string()); }
+    }
+    mic.sort();
+    cam.sort();
+    (mic, cam)
+}
+
+fn sensor_snapshot() -> (Vec<String>, Vec<String>) {
+    if let Some((mut mic, mut cam)) = pipewire_capture_users() {
+        if mic.is_empty() {
+            mic = parse_pactl_microphone_users();
+        }
+        // PipeWire's graph exposes active camera stream clients. Keep the /proc fallback
+        // for direct V4L2 applications that do not use a PipeWire camera node.
+        let (_, direct_cam) = proc_capture_users();
+        for name in direct_cam {
+            if !cam.iter().any(|old| old == &name) { cam.push(name); }
+        }
+        cam.sort();
+        (mic, cam)
+    } else {
+        let mic = parse_pactl_microphone_users();
+        let (_, cam) = proc_capture_users();
+        (mic, cam)
+    }
+}
+
 fn net_state() -> bool {
     fs::read_dir("/sys/class/net").ok().map(|entries| entries.flatten().any(|entry| {
         let name = entry.file_name().to_string_lossy().to_string();
@@ -1530,6 +1661,14 @@ fn poll_start() {
         let mut volume_tick = 0u8;
         let mut media_tick = 0u8;
         let mut window_tick = 0u8;
+        let mut bluetooth_tick = 0u8;
+        let mut sensors_tick = 0u8;
+        let mut bluetooth_current: Option<BTreeMap<String, String>> = None;
+        let mut bluetooth_candidate: Option<BTreeMap<String, String>> = None;
+        let mut bluetooth_candidate_count = 0u8;
+        let mut sensors_current: Option<(Vec<String>, Vec<String>)> = None;
+        let mut sensors_candidate: Option<(Vec<String>, Vec<String>)> = None;
+        let mut sensors_candidate_count = 0u8;
         let mut last_external_window = None;
         let mut window_state_candidate: Option<(bool, bool)> = None;
         let mut window_state_sent: Option<(bool, bool)> = None;
@@ -1540,6 +1679,8 @@ fn poll_start() {
             volume_tick = volume_tick.wrapping_add(1);
             net_tick = net_tick.wrapping_add(1);
             window_tick = window_tick.wrapping_add(1);
+            bluetooth_tick = bluetooth_tick.wrapping_add(1);
+            sensors_tick = sensors_tick.wrapping_add(1);
             if media_tick >= 2 {
                 media_tick = 0;
                 let state = media_metadata();
@@ -1564,6 +1705,52 @@ fn poll_start() {
                 if last_online != Some(online) {
                     emit("helper", json!({ "t": "net", "online": online, "vpn": "", "proxy": std::env::var_os("http_proxy").is_some() || std::env::var_os("https_proxy").is_some(), "first": last_online.is_none() }));
                     last_online = Some(online);
+                }
+            }
+            if bluetooth_tick >= 12 {
+                bluetooth_tick = 0;
+                if let Some(sample) = bluetooth_connected_devices() {
+                    if bluetooth_candidate.as_ref() == Some(&sample) {
+                        bluetooth_candidate_count = bluetooth_candidate_count.saturating_add(1);
+                    } else {
+                        bluetooth_candidate = Some(sample.clone());
+                        bluetooth_candidate_count = 1;
+                    }
+                    if bluetooth_candidate_count >= 2 && bluetooth_current.as_ref() != Some(&sample) {
+                        if let Some(previous) = bluetooth_current.as_ref() {
+                            for (address, name) in &sample {
+                                if !previous.contains_key(address) {
+                                    emit("helper", json!({ "t": "bt", "name": name, "on": true }));
+                                }
+                            }
+                            for (address, name) in previous {
+                                if !sample.contains_key(address) {
+                                    emit("helper", json!({ "t": "bt", "name": name, "on": false }));
+                                }
+                            }
+                        }
+                        bluetooth_current = Some(sample);
+                    }
+                }
+            }
+            if sensors_tick >= 6 {
+                sensors_tick = 0;
+                if setting_flag("sensorDot") {
+                    let sample = sensor_snapshot();
+                    if sensors_candidate.as_ref() == Some(&sample) {
+                        sensors_candidate_count = sensors_candidate_count.saturating_add(1);
+                    } else {
+                        sensors_candidate = Some(sample.clone());
+                        sensors_candidate_count = 1;
+                    }
+                    if sensors_candidate_count >= 2 && sensors_current.as_ref() != Some(&sample) {
+                        emit("helper", json!({ "t": "sensors", "mic": sample.0, "cam": sample.1 }));
+                        sensors_current = Some(sample);
+                    }
+                } else if sensors_current.take().is_some() {
+                    sensors_candidate = None;
+                    sensors_candidate_count = 0;
+                    emit("helper", json!({ "t": "sensors", "mic": [], "cam": [] }));
                 }
             }
             // X11 can inspect the active window geometry. Report only after two matching samples
