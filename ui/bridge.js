@@ -73,6 +73,8 @@ window.qazi = {
 
   setInteractive: (v) => {
     const on = !!v;
+    // Keep the Windows bridge contract unchanged; only Linux needs native region geometry.
+    if (hostPlatform !== 'linux') return quiet(invoke('set_interactive', { on }));
     const seq = ++inputUpdate;
     requestAnimationFrame(() => {
       if (seq !== inputUpdate) return;
@@ -87,7 +89,10 @@ window.qazi = {
   },
   setTyping: (v, restore) => {
     const on = !!v;
-    return invoke('set_typing', { on, restore: !!restore, ...inputBounds() }).catch(() => ({}));
+    const args = hostPlatform === 'linux'
+      ? { on, restore: !!restore, ...inputBounds() }
+      : { on, restore: !!restore };
+    return invoke('set_typing', args).catch(() => ({}));
   },
   lostClick: (info) => quiet(invoke('lost_click', { info: String(info) })),
 
