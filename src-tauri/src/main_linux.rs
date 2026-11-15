@@ -1230,11 +1230,18 @@ fn interaction_watchdog_start() {
         if INPUT_INTERACTIVE.load(Ordering::SeqCst)
             && now_ms().saturating_sub(INPUT_HEARTBEAT.load(Ordering::SeqCst)) > 4_000
         {
-            TYPING_ACTIVE.store(false, Ordering::SeqCst);
+            let was_typing = TYPING_ACTIVE.swap(false, Ordering::SeqCst);
+            // A dead renderer cannot complete its input flow. Drop the saved X11 focus target
+            // rather than unexpectedly restoring a stale application during a later session.
+            previous_x11_window().lock().unwrap().take();
             if let Some(window) = APP.get().and_then(|app| app.get_webview_window("main")) {
                 set_input_interactive(window, false, None);
             }
-            log("The UI stopped renewing its input-capture heartbeat; released pointer input");
+            if was_typing {
+                log("The UI stopped renewing input capture during a text flow; released pointer input");
+            } else {
+                log("The UI stopped renewing input capture; released pointer input");
+            }
         }
     });
 }
