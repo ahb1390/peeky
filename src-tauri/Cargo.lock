@@ -2551,9 +2551,9 @@ dependencies = [
  "base64 0.22.1",
  "cairo-rs",
  "ed25519-compact",
+ "gdkx11",
  "gtk",
  "gtk-layer-shell",
- "gdkx11",
  "image",
  "serde",
  "serde_json",
@@ -2564,7 +2564,8 @@ dependencies = [
  "webview2-com",
  "windows",
  "windows-core",
- "windows-future", "x11-dl",
+ "windows-future",
+ "x11-dl",
 ]
 
 [[package]]

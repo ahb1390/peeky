@@ -12,7 +12,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use glib::object::Cast;
+use gtk::glib::object::Cast;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use tauri::{
