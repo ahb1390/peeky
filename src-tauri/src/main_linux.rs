@@ -138,13 +138,29 @@ where
         return Some(task());
     }
 
-    let window = APP.get()?.get_webview_window("main")?;
+    let Some(app) = APP.get() else {
+        log("Clipboard GTK fallback failed: the Tauri application handle is unavailable");
+        return None;
+    };
+    let Some(window) = app.get_webview_window("main") else {
+        log("Clipboard GTK fallback failed: the main GTK window is unavailable");
+        return None;
+    };
     let (sender, receiver) = mpsc::sync_channel(1);
-    window.run_on_main_thread(move || {
+    if let Err(error) = window.run_on_main_thread(move || {
         let value = task();
         let _ = sender.send(value);
-    }).ok()?;
-    receiver.recv_timeout(Duration::from_secs(4)).ok()
+    }) {
+        log(&format!("Clipboard GTK fallback could not enter the GTK main thread: {error}"));
+        return None;
+    }
+    match receiver.recv_timeout(Duration::from_secs(4)) {
+        Ok(value) => Some(value),
+        Err(error) => {
+            log(&format!("Clipboard GTK fallback timed out on the GTK main thread: {error}"));
+            None
+        }
+    }
 }
 
 fn gtk_clipboard_read_text() -> Option<String> {
@@ -158,8 +174,14 @@ fn gtk_clipboard_read_text() -> Option<String> {
 fn gtk_clipboard_write_text(text: &str, persist: bool) -> bool {
     let text = text.to_string();
     gtk_main_call(move || {
-        let Some(display) = gtk::gdk::Display::default() else { return false; };
-        let Some(clipboard) = gtk::Clipboard::default(&display) else { return false; };
+        let Some(display) = gtk::gdk::Display::default() else {
+            log("GTK text clipboard failed: no default GDK display");
+            return false;
+        };
+        let Some(clipboard) = gtk::Clipboard::default(&display) else {
+            log("GTK text clipboard failed: the display has no clipboard selection");
+            return false;
+        };
         clipboard.set_text(&text);
         if persist {
             clipboard.store();
@@ -180,11 +202,21 @@ fn gtk_clipboard_read_image() -> Option<Vec<u8>> {
 fn gtk_clipboard_write_png(bytes: &[u8]) -> bool {
     let bytes = bytes.to_vec();
     gtk_main_call(move || {
-        let Ok(pixbuf) = gtk::gdk_pixbuf::Pixbuf::from_read(Cursor::new(bytes)) else {
+        let pixbuf = match gtk::gdk_pixbuf::Pixbuf::from_read(Cursor::new(bytes)) {
+            Ok(pixbuf) => pixbuf,
+            Err(error) => {
+                log(&format!("GTK image clipboard failed to decode the PNG: {error}"));
+                return false;
+            }
+        };
+        let Some(display) = gtk::gdk::Display::default() else {
+            log("GTK image clipboard failed: no default GDK display");
             return false;
         };
-        let Some(display) = gtk::gdk::Display::default() else { return false; };
-        let Some(clipboard) = gtk::Clipboard::default(&display) else { return false; };
+        let Some(clipboard) = gtk::Clipboard::default(&display) else {
+            log("GTK image clipboard failed: the display has no clipboard selection");
+            return false;
+        };
         clipboard.set_image(&pixbuf);
         clipboard.store();
         true
@@ -422,6 +454,59 @@ fn clipboard_read() -> Option<String> {
     gtk_clipboard_read_text()
 }
 
+// The clipboard helpers normally daemonize after taking ownership. Check their parent
+// process result when it exits quickly; if it remains alive, that is expected while it
+// continues serving the selection to other applications.
+fn clipboard_helper_write(program: &str, args: &[&str], bytes: &[u8]) -> bool {
+    let mut child = match Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            log(&format!("Could not start clipboard helper {program}: {error}"));
+            return false;
+        }
+    };
+
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        log(&format!("Clipboard helper {program} did not expose standard input"));
+        return false;
+    };
+    if let Err(error) = stdin.write_all(bytes) {
+        drop(stdin);
+        let _ = child.kill();
+        log(&format!("Clipboard helper {program} rejected clipboard data: {error}"));
+        return false;
+    }
+    drop(stdin);
+
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let success = child.wait().map(|status| status.success()).unwrap_or(false);
+        let _ = sender.send(success);
+    });
+
+    match receiver.recv_timeout(Duration::from_millis(450)) {
+        Ok(true) => true,
+        Ok(false) => {
+            log(&format!("Clipboard helper {program} exited unsuccessfully; trying GTK clipboard"));
+            false
+        }
+        // A live process is normal for clipboard owners that have to keep serving
+        // the selection. The payload was written and the owner is still running.
+        Err(mpsc::RecvTimeoutError::Timeout) => true,
+        Err(error) => {
+            log(&format!("Could not collect clipboard helper {program} status: {error}"));
+            false
+        }
+    }
+}
+
 fn clipboard_write(text: &str, private: bool) -> bool {
     let wayland = is_wayland();
     let program = if wayland {
@@ -435,31 +520,20 @@ fn clipboard_write(text: &str, private: bool) -> bool {
     };
 
     if let Some(program) = program {
-        let mut cmd = Command::new(program);
-        if wayland {
-            if private { cmd.arg("--sensitive"); }
-        } else if program == "xclip" {
-            cmd.args(["-selection", "clipboard", "-i"]);
-        } else {
-            cmd.args(["--clipboard", "--input"]);
-        }
-
-        match cmd.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
-            Ok(mut child) => {
-                if let Some(mut stdin) = child.stdin.take() {
-                    if stdin.write_all(text.as_bytes()).is_ok() {
-                        drop(stdin);
-                        // Clipboard owners remain alive until another application requests
-                        // or replaces the selection. Reap them without blocking the caller.
-                        thread::spawn(move || { let _ = child.wait(); });
-                        *last_clipboard().lock().unwrap() = text.to_string();
-                        return true;
-                    }
-                }
-                let _ = child.kill();
-                log(&format!("Clipboard helper {program} failed while writing; trying GTK clipboard"));
+        let copied = if wayland {
+            if private {
+                clipboard_helper_write(program, &["--sensitive"], text.as_bytes())
+            } else {
+                clipboard_helper_write(program, &[], text.as_bytes())
             }
-            Err(error) => log(&format!("Could not start clipboard helper {program}: {error}; trying GTK clipboard")),
+        } else if program == "xclip" {
+            clipboard_helper_write(program, &["-selection", "clipboard", "-i"], text.as_bytes())
+        } else {
+            clipboard_helper_write(program, &["--clipboard", "--input"], text.as_bytes())
+        };
+        if copied {
+            *last_clipboard().lock().unwrap() = text.to_string();
+            return true;
         }
     }
 
@@ -1505,19 +1579,9 @@ fn clipboard_write_png(bytes: &[u8]) -> bool {
     };
 
     if let Some((program, args)) = helper {
-        match Command::new(program).args(&args)
-            .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
-            Ok(mut child) => {
-                let wrote = child.stdin.take().is_some_and(|mut stdin| stdin.write_all(bytes).is_ok());
-                if wrote {
-                    thread::spawn(move || { let _ = child.wait(); });
-                    *last_clipboard().lock().unwrap() = format!("image:{:016x}", image_hash(bytes));
-                    return true;
-                }
-                let _ = child.kill();
-                log(&format!("Image clipboard helper {program} failed while writing; trying GTK clipboard"));
-            }
-            Err(error) => log(&format!("Could not start image clipboard helper {program}: {error}; trying GTK clipboard")),
+        if clipboard_helper_write(program, &args, bytes) {
+            *last_clipboard().lock().unwrap() = format!("image:{:016x}", image_hash(bytes));
+            return true;
         }
     }
 
